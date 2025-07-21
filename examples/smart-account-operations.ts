@@ -2,19 +2,19 @@ import { Keypair, BASE_FEE, hash, nativeToScVal } from "@stellar/stellar-sdk";
 import { Buffer } from "buffer";
 import { Client as FactoryClient } from "factory";
 import {
-  Client as SmartWalletClient,
+  Client as SmartAccountClient,
   Signer,
   SignerKey,
   SignerProof,
   xdr,
-} from "smart_wallet";
+} from "smart_account";
 import {
   FACTORY_WASM_HASH,
   ADMIN_SIGNER_KEYPAIR,
   ROOT_KEYPAIR,
   DEPLOYER_KEYPAIR,
   DELEGATED_SIGNER_KEYPAIR,
-  SW_WASM_HASH,
+  SA_WASM_HASH,
   CONSTRUCTOR_FUNC,
   RPC_URL,
   NETWORK,
@@ -29,11 +29,11 @@ import { Server } from "@stellar/stellar-sdk/rpc";
 import { printAuthEntries } from "./utils.js";
 
 /**
- * Example TypeScript application demonstrating smart wallet deployment and usage
+ * Example TypeScript application demonstrating smart account deployment and usage
  *
  * This example shows:
  * 1. Factory contract deployment with role-based access control
- * 2. Smart wallet deployment using the factory
+ * 2. Smart account deployment using the factory
  * 3. Signer management (add, update, revoke)
  * 4. Placeholder for transaction signing and submission
  */
@@ -58,17 +58,17 @@ async function confirmTransaction(
 }
 
 /**
- * Utility function to authorize transaction entries with smart wallet
+ * Utility function to authorize transaction entries with smart account
  */
-async function authorizeWithSmartWallet(
+async function authorizeWithSmartAccount(
   tx: any,
-  smartWalletContractId: string,
+  smartAccountContractId: string,
   signerKeypair: Keypair,
-  smartWalletClient: SmartWalletClient
+  smartAccountClient: SmartAccountClient
 ): Promise<void> {
   const server = new Server(RPC_URL);
   await tx.signAuthEntries({
-    address: smartWalletContractId,
+    address: smartAccountContractId,
     authorizeEntry: async (entry: any) => {
       const clone = xdr.SorobanAuthorizationEntry.fromXDR(entry.toXDR());
       const credentials = clone.credentials().address();
@@ -119,9 +119,9 @@ async function authorizeWithSmartWallet(
       const scValType = xdr.ScSpecTypeDef.scSpecTypeUdt(
         new xdr.ScSpecTypeUdt({ name: "SignerProof" })
       );
-      const scKey = smartWalletClient.spec.nativeToScVal(key, scKeyType);
+      const scKey = smartAccountClient.spec.nativeToScVal(key, scKeyType);
       const scVal = val
-        ? smartWalletClient.spec.nativeToScVal(val, scValType)
+        ? smartAccountClient.spec.nativeToScVal(val, scValType)
         : xdr.ScVal.scvVoid();
       const scEntry = new xdr.ScMapEntry({
         key: scKey,
@@ -255,11 +255,11 @@ async function grantDeployerRole(factoryContractId: string): Promise<void> {
 }
 
 /**
- * Step 3: Deploy a smart wallet using the factory
+ * Step 3: Deploy a smart account using the factory
  */
-async function deploySmartWallet(factoryContractId: string): Promise<string> {
+async function deploySmartAccount(factoryContractId: string): Promise<string> {
   console.log("\n" + "=".repeat(60));
-  console.log("💼 STEP 3: DEPLOYING SMART WALLET");
+  console.log("💼 STEP 3: DEPLOYING SMART ACCOUNT");
   console.log("=".repeat(60));
 
   const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
@@ -275,12 +275,12 @@ async function deploySmartWallet(factoryContractId: string): Promise<string> {
   try {
     const addressTx = await factoryClient.get_deployed_address({ salt });
     const predictedAddress = addressTx.result;
-    console.log("📍 Predicted smart wallet address:", predictedAddress);
+    console.log("📍 Predicted smart account address:", predictedAddress);
 
     const constructor_args = {
       signers: [createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)],
     };
-    const smartWalletClient = new SmartWalletClient({
+    const smartAccountClient = new SmartAccountClient({
       contractId: predictedAddress,
       networkPassphrase: NETWORK,
       rpcUrl: RPC_URL,
@@ -291,12 +291,14 @@ async function deploySmartWallet(factoryContractId: string): Promise<string> {
     const deployTx = await factoryClient.deploy(
       {
         caller: DEPLOYER_KEYPAIR.publicKey(),
-        wasm_hash: Buffer.from(SW_WASM_HASH, "hex"),
-        salt: salt,
-        constructor_args: smartWalletClient.spec.funcArgsToScVals(
-          CONSTRUCTOR_FUNC,
-          constructor_args
-        ),
+        deployment_args: {
+          wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
+          salt: salt,
+          constructor_args: smartAccountClient.spec.funcArgsToScVals(
+            CONSTRUCTOR_FUNC,
+            constructor_args
+          ),
+        },
       },
       {
         simulate: true,
@@ -314,35 +316,35 @@ async function deploySmartWallet(factoryContractId: string): Promise<string> {
     const hash = result.sendTransactionResponse?.hash;
     if (!hash) {
       throw new Error(
-        "Smart wallet deployment failed: " + JSON.stringify(result)
+        "Smart account deployment failed: " + JSON.stringify(result)
       );
     }
 
     console.log("📤 Transaction submitted with hash:", hash);
-    await confirmTransaction(hash, "Smart wallet deployment");
+    await confirmTransaction(hash, "Smart account deployment");
 
     const contractId = deployTx.result;
 
-    console.log("✅ Smart wallet deployed successfully");
-    console.log("📍 Smart wallet contract ID:", contractId);
+    console.log("✅ Smart account deployed successfully");
+    console.log("📍 Smart account contract ID:", contractId);
 
     return contractId;
   } catch (error) {
-    console.error("❌ Smart wallet deployment failed:", error);
+    console.error("❌ Smart account deployment failed:", error);
     throw error;
   }
 }
 
 /**
- * Step 4: Add additional signers to the smart wallet
+ * Step 4: Add additional signers to the smart account
  */
-async function addSigner(smartWalletContractId: string): Promise<void> {
+async function addSigner(smartAccountContractId: string): Promise<void> {
   console.log("\n" + "=".repeat(60));
-  console.log("➕ STEP 4: ADDING SIGNER TO SMART WALLET");
+  console.log("➕ STEP 4: ADDING SIGNER TO SMART ACCOUNT");
   console.log("=".repeat(60));
 
-  const smartWalletClient = new SmartWalletClient({
-    contractId: smartWalletContractId,
+  const smartAccountClient = new SmartAccountClient({
+    contractId: smartAccountContractId,
     networkPassphrase: NETWORK,
     rpcUrl: RPC_URL,
     allowHttp: false,
@@ -350,7 +352,7 @@ async function addSigner(smartWalletContractId: string): Promise<void> {
   });
 
   try {
-    const addSignerTx = await smartWalletClient.add_signer(
+    const addSignerTx = await smartAccountClient.add_signer(
       {
         signer: {
           tag: "Ed25519",
@@ -368,11 +370,11 @@ async function addSigner(smartWalletContractId: string): Promise<void> {
     );
 
     printAuthEntries(addSignerTx);
-    await authorizeWithSmartWallet(
+    await authorizeWithSmartAccount(
       addSignerTx,
-      smartWalletContractId,
+      smartAccountContractId,
       ADMIN_SIGNER_KEYPAIR,
-      smartWalletClient
+      smartAccountClient
     );
     await addSignerTx.simulate();
     await addSignerTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
@@ -399,18 +401,127 @@ async function addSigner(smartWalletContractId: string): Promise<void> {
 }
 
 /**
- * Step 5: Send a hello world transaction with smart wallet authorization
+ * Step 3/4: Deploy and invoke a contract with the smart account
  */
-async function sendHelloWorldTransactionWithSmartWalletAuth(
-  smartWalletContractId: string,
+async function deployAndInvokeContractWithSmartAccount(
+  factoryContractId: string
+): Promise<string> {
+  console.log("\n" + "=".repeat(60));
+  console.log(
+    "➕ STEP 3/4 (Alternative): DEPLOYING AND INVOKING CONTRACT WITH SMART ACCOUNT"
+  );
+  console.log("=".repeat(60));
+  const salt = Buffer.from(crypto.getRandomValues(new Uint8Array(32)));
+  const factoryClient = new FactoryClient({
+    contractId: factoryContractId,
+    networkPassphrase: NETWORK,
+    rpcUrl: RPC_URL,
+    allowHttp: false,
+    publicKey: TREASURY_KEYPAIR.publicKey(),
+  });
+  const walletAddress = (await factoryClient.get_deployed_address({ salt }))
+    .result;
+
+  console.log("📍 Predicted smart account address:", walletAddress);
+  const smartAccountClient = new SmartAccountClient({
+    contractId: walletAddress,
+    networkPassphrase: NETWORK,
+    rpcUrl: RPC_URL,
+    allowHttp: false,
+    publicKey: TREASURY_KEYPAIR.publicKey(),
+  });
+  const addSignerArgs = {
+    signer: {
+      tag: "Ed25519",
+      values: [
+        {
+          public_key: Buffer.from(DELEGATED_SIGNER_KEYPAIR.rawPublicKey()),
+        },
+        { tag: "Standard", values: undefined },
+      ] as const,
+    },
+  };
+  console.log("📍 Encoding signer args:", addSignerArgs);
+  const addSignerVal = smartAccountClient.spec.funcArgsToScVals(
+    "add_signer",
+    addSignerArgs
+  );
+  console.log("📍 Encoded signer args");
+  // Requires both deployer and wallet auth
+  const combinedTx = await factoryClient.deploy_account_and_invoke(
+    {
+      caller: DEPLOYER_KEYPAIR.publicKey(),
+      deployment_args: {
+        wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
+        salt: salt,
+        constructor_args: smartAccountClient.spec.funcArgsToScVals(
+          CONSTRUCTOR_FUNC,
+          {
+            signers: [createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)],
+          }
+        ),
+      },
+      calls: [
+        // Requires wallet auth
+        {
+          contract_id: walletAddress,
+          func: "add_signer",
+          args: addSignerVal,
+        },
+        // Requires wallet auth
+        {
+          contract_id: HELLO_WORLD_CONTRACT_ID,
+          func: "hello",
+          args: [
+            nativeToScVal(walletAddress, {
+              type: "address",
+            }),
+          ],
+        },
+      ],
+    },
+    {
+      simulate: true,
+    }
+  );
+
+  console.log("📍 Combined transaction simulated successfully. Signing...");
+  printAuthEntries(combinedTx);
+  await authorizeWithSmartAccount(
+    combinedTx,
+    walletAddress,
+    ADMIN_SIGNER_KEYPAIR,
+    smartAccountClient
+  );
+  await combinedTx.signAuthEntries({
+    address: DEPLOYER_KEYPAIR.publicKey(),
+    ...basicNodeSigner(DEPLOYER_KEYPAIR, NETWORK),
+  });
+  await combinedTx.simulate();
+  await combinedTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
+  const result = await combinedTx.send();
+  const txHash = result.sendTransactionResponse?.hash;
+  if (!txHash) {
+    throw new Error("Combined transaction failed: " + JSON.stringify(result));
+  }
+  console.log("📤 Transaction submitted with hash:", txHash);
+  await confirmTransaction(txHash, "Combined transaction");
+  console.log("✅ Combined transaction completed successfully");
+  return walletAddress;
+}
+/**
+ * Step 5: Send a hello world transaction with smart account authorization
+ */
+async function sendHelloWorldTransactionWithSmartAccountAuth(
+  smartAccountContractId: string,
   step: string
 ): Promise<void> {
   console.log("\n" + "=".repeat(60));
   console.log(`🌍 STEP ${step}: SENDING HELLO WORLD TRANSACTION`);
   console.log("=".repeat(60));
 
-  const smartWalletClient = new SmartWalletClient({
-    contractId: smartWalletContractId,
+  const smartAccountClient = new SmartAccountClient({
+    contractId: smartAccountContractId,
     networkPassphrase: NETWORK,
     rpcUrl: RPC_URL,
     allowHttp: false,
@@ -421,7 +532,7 @@ async function sendHelloWorldTransactionWithSmartWalletAuth(
     const helloWorldTx = await AssembledTransaction.build<string[]>({
       method: "hello",
       args: [
-        nativeToScVal(smartWalletContractId, {
+        nativeToScVal(smartAccountContractId, {
           type: "address",
         }),
       ],
@@ -442,11 +553,11 @@ async function sendHelloWorldTransactionWithSmartWalletAuth(
     });
 
     printAuthEntries(helloWorldTx);
-    await authorizeWithSmartWallet(
+    await authorizeWithSmartAccount(
       helloWorldTx,
-      smartWalletContractId,
+      smartAccountContractId,
       DELEGATED_SIGNER_KEYPAIR,
-      smartWalletClient
+      smartAccountClient
     );
     await helloWorldTx.simulate();
     await helloWorldTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
@@ -469,17 +580,17 @@ async function sendHelloWorldTransactionWithSmartWalletAuth(
 }
 
 /**
- * Step 6: Upgrade the smart wallet
+ * Step 6: Upgrade the smart account
  */
-async function upgradeSmartWallet(
-  smartWalletContractId: string
+async function upgradeSmartAccount(
+  smartAccountContractId: string
 ): Promise<void> {
   console.log("\n" + "=".repeat(60));
-  console.log("➕ STEP 6: UPGRADING SMART WALLET");
+  console.log("➕ STEP 6: UPGRADING SMART ACCOUNT");
   console.log("=".repeat(60));
 
-  const smartWalletClient = new SmartWalletClient({
-    contractId: smartWalletContractId,
+  const smartAccountClient = new SmartAccountClient({
+    contractId: smartAccountContractId,
     networkPassphrase: NETWORK,
     rpcUrl: RPC_URL,
     allowHttp: false,
@@ -487,9 +598,9 @@ async function upgradeSmartWallet(
   });
 
   try {
-    const upgradeTx = await smartWalletClient.upgrade(
+    const upgradeTx = await smartAccountClient.upgrade(
       {
-        new_wasm_hash: Buffer.from(SW_WASM_HASH, "hex"),
+        new_wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
       },
       {
         simulate: true,
@@ -497,11 +608,11 @@ async function upgradeSmartWallet(
     );
 
     printAuthEntries(upgradeTx);
-    await authorizeWithSmartWallet(
+    await authorizeWithSmartAccount(
       upgradeTx,
-      smartWalletContractId,
+      smartAccountContractId,
       ADMIN_SIGNER_KEYPAIR,
-      smartWalletClient
+      smartAccountClient
     );
     await upgradeTx.simulate();
     await upgradeTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
@@ -509,16 +620,16 @@ async function upgradeSmartWallet(
     const txHash = result.sendTransactionResponse?.hash;
     if (!txHash) {
       throw new Error(
-        "Upgrade smart wallet transaction failed: " + JSON.stringify(result)
+        "Upgrade smart account transaction failed: " + JSON.stringify(result)
       );
     }
 
     console.log("📤 Transaction submitted with hash:", txHash);
-    await confirmTransaction(txHash, "Upgrade smart wallet");
+    await confirmTransaction(txHash, "Upgrade smart account");
 
-    console.log("✅ Smart wallet upgraded successfully");
+    console.log("✅ Smart account upgraded successfully");
   } catch (error) {
-    console.error("❌ Failed to upgrade smart wallet:", error);
+    console.error("❌ Failed to upgrade smart account:", error);
     throw error;
   }
 }
@@ -539,7 +650,7 @@ function createAdminSignerFromKeypair(adminSignerKeyPair: Keypair): Signer {
  * Main example function demonstrating the complete workflow
  */
 async function main() {
-  console.log("🚀 STARTING SMART WALLET DEPLOYMENT EXAMPLE");
+  console.log("🚀 STARTING SMART ACCOUNT DEPLOYMENT EXAMPLE");
   console.log("🌐 Network:", NETWORK);
   console.log("🔗 RPC URL:", RPC_URL);
   console.log("\n🔑 Generated keypairs:");
@@ -552,15 +663,17 @@ async function main() {
   try {
     const factoryContractId = await deployFactory();
     await grantDeployerRole(factoryContractId);
-    const smartWalletContractId = await deploySmartWallet(factoryContractId);
-    await addSigner(smartWalletContractId);
-    await sendHelloWorldTransactionWithSmartWalletAuth(
-      smartWalletContractId,
+    const _smartAccountContractId = await deploySmartAccount(factoryContractId);
+    await addSigner(_smartAccountContractId);
+    const smartAccountContractId =
+      await deployAndInvokeContractWithSmartAccount(factoryContractId);
+    await sendHelloWorldTransactionWithSmartAccountAuth(
+      smartAccountContractId,
       "5"
     );
-    await upgradeSmartWallet(smartWalletContractId);
-    await sendHelloWorldTransactionWithSmartWalletAuth(
-      smartWalletContractId,
+    await upgradeSmartAccount(smartAccountContractId);
+    await sendHelloWorldTransactionWithSmartAccountAuth(
+      smartAccountContractId,
       "7"
     );
 
@@ -569,7 +682,7 @@ async function main() {
     console.log("=".repeat(60));
     console.log("✅ All operations completed successfully!");
     console.log("🏭 Factory Contract ID:", factoryContractId);
-    console.log("💼 Smart Wallet Contract ID:", smartWalletContractId);
+    console.log("💼 Smart Account Contract ID:", smartAccountContractId);
     console.log("🔑 Admin Signer:", ADMIN_SIGNER_KEYPAIR.publicKey());
     console.log("🔗 Delegated Signer:", DELEGATED_SIGNER_KEYPAIR.publicKey());
   } catch (error) {
@@ -584,4 +697,4 @@ main()
   })
   .catch(console.error);
 
-export { deployFactory, grantDeployerRole, deploySmartWallet };
+export { deployFactory, grantDeployerRole, deploySmartAccount };

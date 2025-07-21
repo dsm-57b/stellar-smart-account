@@ -1,4 +1,4 @@
-# Stellar Smart Account System
+# Stellar Smart Account
 
 [![Rust](https://img.shields.io/badge/rust-1.75+-orange.svg)](https://www.rust-lang.org)
 [![Soroban SDK](https://img.shields.io/badge/soroban--sdk-22.0.0-blue.svg)](https://soroban.stellar.org/)
@@ -9,7 +9,7 @@ A comprehensive smart contract system for Stellar/Soroban that provides enterpri
 
 ## 🌟 Features
 
-- **🔐 Multi-Signature Wallet**: Advanced smart wallet with customizable authentication
+- **🔐 Multi-Signature Account**: Advanced smart account with customizable authentication
 - **🏭 Contract Factory**: Secure deployment system with role-based access control  
 - **🎯 Role-Based Permissions**: Admin, Standard, and Restricted signer roles
 - **📋 Policy System**: Time-based, contract allow/deny lists, and extensible policies
@@ -25,20 +25,20 @@ The system consists of two main smart contracts and supporting JavaScript librar
 ```
 stellar-smart-account/
 ├── contracts/
-│   ├── smart-wallet/          # Multi-signature wallet contract
+│   ├── smart-account/         # Multi-signature account contract
 │   ├── contract-factory/      # Secure contract deployment factory
 │   ├── initializable/         # Contract initialization utilities
 │   ├── storage/              # Storage management utilities
 │   └── upgradeable/          # Contract upgrade utilities
 ├── packages/
-│   ├── smart_wallet/         # TypeScript bindings for smart wallet
+│   ├── smart_account/        # TypeScript bindings for smart account
 │   └── factory/              # TypeScript bindings for factory
 └── examples/                 # Usage examples and demos
 ```
 
-### Smart Wallet Contract
+### Smart Account Contract
 
-The core smart wallet provides:
+The core smart account provides:
 
 - **Multiple Signature Schemes**: Ed25519 and Secp256r1 (WebAuthn/passkeys), extensible to others
 - **Flexible Authorization**: Role-based access with policy enforcement
@@ -81,7 +81,7 @@ cargo test
 
 4. **Install JavaScript dependencies** (optional):
 ```bash
-cd packages/smart_wallet && npm install
+cd packages/smart_account && npm install
 cd ../factory && npm install
 ```
 
@@ -148,7 +148,7 @@ The project maintains 80%+ test coverage with comprehensive integration tests.
 3. Add to `SignerPolicy` enum
 4. Update policy validation logic
 
-See the [Smart Wallet Architecture Documentation](contracts/smart-wallet/README.md) for detailed extension guides.
+See the [Smart Account Architecture Documentation](contracts/smart-account/README.md) for detailed extension guides.
 
 ## 🌐 Network Support
 

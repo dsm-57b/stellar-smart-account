@@ -17,9 +17,9 @@ importers:
       factory:
         specifier: file:../packages/factory
         version: file:../packages/factory
-      smart_wallet:
-        specifier: file:../packages/smart_wallet
-        version: file:../packages/smart_wallet
+      smart_account:
+        specifier: file:../packages/smart_account
+        version: file:../packages/smart_account
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
@@ -406,8 +406,8 @@ packages:
     engines: {node: '>= 0.10'}
     hasBin: true
 
-  smart_wallet@file:../packages/smart_wallet:
-    resolution: {directory: ../packages/smart_wallet, type: directory}
+  smart_account@file:../packages/smart_account:
+    resolution: {directory: ../packages/smart_account, type: directory}
 
   to-buffer@1.2.1:
     resolution: {integrity: sha512-tB82LpAIWjhLYbqjx3X4zEeHN6M8CiuOEy2JY8SEQVdYRe3CCHOFaqrBW1doLDrfpWhplcW7BL+bO3/6S3pcDQ==}
@@ -777,7 +777,7 @@ snapshots:
       safe-buffer: 5.2.1
       to-buffer: 1.2.1
 
-  smart_wallet@file:../packages/smart_wallet:
+  smart_account@file:../packages/smart_account:
     dependencies:
       '@stellar/stellar-sdk': 14.0.0-rc.3
       buffer: 6.0.3
