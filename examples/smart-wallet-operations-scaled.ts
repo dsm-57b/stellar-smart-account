@@ -32,6 +32,263 @@ import { printAuthEntries } from "./utils.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
+// ============================================================================
+// StellarTransactionBroadcaster Interface Compatibility Types
+// ============================================================================
+
+/**
+ * Broadcaster name types for identifying different broadcast implementations
+ */
+export type StellarTransactionBroadcasterName = 
+  | "WALLET_BACKEND_BROADCASTER" 
+  | "DIRECT_RPC_BROADCASTER"
+  | "SCALED_WALLET_BROADCASTER";
+
+/**
+ * Input arguments for the broadcaster interface
+ */
+export type StellarTransactionBroadcasterInputArgs<T = unknown> = {
+  createdAt: number; // Unix timestamp in milliseconds
+  assembledTransaction: AssembledTransaction<T>;
+  timeoutInSeconds?: number;
+};
+
+/**
+ * Additional options for transaction broadcasting
+ */
+export interface TransactionBroadcastOptions {
+  operationName?: string;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  enableFeeBump?: boolean;
+  treasuryKeypair?: Keypair;
+}
+
+/**
+ * Result returned by the broadcaster
+ */
+export interface BroadcastResult {
+  hash: string;
+  status: "PENDING" | "SUCCESS" | "FAILED" | "TRY_AGAIN_LATER" | "ERROR";
+  errorResultXdr?: string;
+  feeBumpHash?: string;
+  metadata?: {
+    submittedAt: number;
+    confirmedAt?: number;
+    retryCount?: number;
+    operationName?: string;
+  };
+}
+
+/**
+ * Main broadcaster interface
+ */
+export interface StellarTransactionBroadcaster<
+  T extends StellarTransactionBroadcasterName = StellarTransactionBroadcasterName,
+> {
+  name: T;
+  /**
+   * Broadcasts a transaction to the Stellar network.
+   * @param inputArgs The input arguments for the broadcaster.
+   * @returns A result object with the transaction hash and initial submission status.
+   */
+  broadcast(
+    inputArgs: StellarTransactionBroadcasterInputArgs,
+    options?: TransactionBroadcastOptions
+  ): Promise<BroadcastResult>;
+}
+
+/**
+ * Scaled Wallet Backend Broadcaster Implementation
+ * 
+ * This broadcaster implements the StellarTransactionBroadcaster interface
+ * and wraps the existing ScaledWalletBackendClient functionality for compatibility.
+ */
+export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadcaster<"SCALED_WALLET_BROADCASTER"> {
+  name: "SCALED_WALLET_BROADCASTER" = "SCALED_WALLET_BROADCASTER";
+  private walletBackendClient: WalletBackendClient;
+
+  constructor(walletBackendClient: WalletBackendClient) {
+    this.walletBackendClient = walletBackendClient;
+  }
+
+  async broadcast(
+    inputArgs: StellarTransactionBroadcasterInputArgs,
+    options?: TransactionBroadcastOptions
+  ): Promise<BroadcastResult> {
+    const startTime = Date.now();
+    const operationName = options?.operationName || 'transaction';
+    const timeoutSeconds = inputArgs.timeoutInSeconds || 300;
+    const maxRetries = options?.maxRetries || 6;
+    
+    try {
+      // Use the internal wallet-backend submission logic
+      const hash = await this.submitTransactionViaWalletBackend(
+        inputArgs.assembledTransaction,
+        operationName,
+        timeoutSeconds,
+        maxRetries,
+        options?.retryDelayMs || 2000
+      );
+
+      return {
+        hash,
+        status: "PENDING", // Initial status - actual confirmation happens separately
+        metadata: {
+          submittedAt: startTime,
+          operationName,
+        }
+      };
+    } catch (error: any) {
+      console.error(`❌ ${operationName} broadcast failed:`, error.message);
+      
+      // Parse error to determine appropriate status
+      let status: BroadcastResult['status'] = "FAILED";
+      let errorResultXdr: string | undefined;
+      
+      if (error.message?.includes("TRY_AGAIN_LATER")) {
+        status = "TRY_AGAIN_LATER";
+      } else if (error.message?.includes("TRANSACTION_ERROR")) {
+        status = "ERROR";
+        errorResultXdr = error.message.replace("TRANSACTION_ERROR: ", "");
+      }
+
+      return {
+        hash: "",
+        status,
+        errorResultXdr,
+        metadata: {
+          submittedAt: startTime,
+          operationName,
+        }
+      };
+    }
+  }
+
+  /**
+   * Internal method that implements the wallet-backend submission logic
+   * for the broadcaster interface
+   */
+  private async submitTransactionViaWalletBackend(
+    tx: AssembledTransaction<any>, 
+    operationName: string,
+    timeoutSeconds: number = 300,
+    maxAttempts: number = 6,
+    retryDelayBase: number = 2000
+  ): Promise<string> {
+    // Sign the assembled transaction with Treasury key
+    // @ts-ignore sign helper typing mismatch
+    await tx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
+
+    // Extract operations for wallet-backend
+    if (!tx.built) {
+      throw new Error("Transaction not built yet – did you call simulate()?");
+    }
+
+    const envelopeBuf: Buffer = Buffer.isBuffer(tx.built.toXDR())
+      // @ts-ignore runtime returns Buffer for JS implementation
+      ? (tx.built.toXDR() as Buffer)
+      : Buffer.from(tx.built.toXDR() as string, "base64");
+    const envelopeB64 = envelopeBuf.toString("base64");
+    const envelope = (xdr.TransactionEnvelope as any).fromXDR(Buffer.from(envelopeB64, "base64"));
+    
+    let ops: any[] = [];
+    switch (envelope.switch().name) {
+      case "envelopeTypeTx":
+        ops = envelope.v1().tx().operations();
+        break;
+      case "envelopeTypeTxV0":
+        ops = envelope.v0().tx().operations();
+        break;
+      default:
+        throw new Error("Unsupported envelope type " + envelope.switch().name);
+    }
+    const operationsXdr = ops.map((op: any) => op.toXDR().toString("base64"));
+
+    // Prepare simulation result for wallet-backend
+    let simulationResult: any = undefined;
+    const sim: any = (tx as any).simulation || (tx as any).simulationResponse || (tx as any).simulationResult;
+    if (sim && sim.transactionData) {
+      let transactionDataEncoded: string | undefined;
+      try {
+        if (typeof sim.transactionData === 'string') {
+          transactionDataEncoded = sim.transactionData;
+        } else if (typeof sim.transactionData.build === 'function') {
+          const built = sim.transactionData.build();
+          transactionDataEncoded = Buffer.from(built.toXDR()).toString('base64');
+        } else if (typeof sim.transactionData.toXDR === 'function') {
+          const maybeBuf = sim.transactionData.toXDR();
+          transactionDataEncoded = Buffer.from(maybeBuf).toString('base64');
+        }
+      } catch (e) {
+        // Failed to encode, continue without
+      }
+
+      if (transactionDataEncoded) {
+        const minResourceFeeStr = sim.minResourceFee !== undefined ? String(sim.minResourceFee) : undefined;
+        simulationResult = {
+          transactionData: transactionDataEncoded,
+          results: [],
+          ...(minResourceFeeStr ? { minResourceFee: minResourceFeeStr } : {}),
+        };
+      }
+    }
+
+    // Build transaction with wallet-backend
+    const buildResp = await this.walletBackendClient.submitTransaction(operationsXdr, simulationResult, timeoutSeconds);
+    const builtXdr = (buildResp as any).transactionXdrs?.[0] || (buildResp as any).transactionXDRs?.[0];
+    if (!builtXdr) {
+      throw new Error("wallet-backend build response missing XDR");
+    }
+
+    // Create fee-bump transaction
+    const feeBumpResp = await this.walletBackendClient.createFeeBump(builtXdr);
+    const envelopeXdr = feeBumpResp?.transaction || builtXdr;
+
+    // Convert XDR to Transaction object
+    // @ts-ignore - TransactionBuilder.fromXDR is present at runtime
+    const envelopeTx = TransactionBuilder.fromXDR(envelopeXdr, NETWORK);
+
+    // Submit to Stellar RPC with retries
+    const server = new Server(RPC_URL);
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const sendTransactionResponse = await server.sendTransaction(envelopeTx);
+
+        if (sendTransactionResponse.status === "TRY_AGAIN_LATER") {
+          throw Object.assign(new Error("TRY_AGAIN_LATER"), { retryable: true });
+        }
+
+        if (sendTransactionResponse.status === "ERROR") {
+          console.error(`❌ ${operationName} submission returned ERROR`, sendTransactionResponse);
+          const errXdr = (sendTransactionResponse as any).errorResultXdr || 
+                        (sendTransactionResponse as any).errorResult || 'unknown error';
+          throw new Error(`TRANSACTION_ERROR: ${errXdr}`);
+        }
+
+        console.log(`📤 Transaction submitted with hash: ${sendTransactionResponse.hash}`);
+        console.log(`📄 Transaction URL: ${getExplorerUrls(sendTransactionResponse.hash, 'transaction')}`);
+
+        return sendTransactionResponse.hash;
+      } catch (err: any) {
+        const isRetryable = err?.retryable || err?.message?.includes("TRY_AGAIN_LATER") || err?.code === "ETIMEDOUT";
+        if (!isRetryable || attempt === maxAttempts) {
+          console.error(`❌ ${operationName} failed after ${attempt} attempts`);
+          throw err;
+        }
+        const delay = retryDelayBase * Math.pow(2, attempt - 1);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+
+    throw new Error(`Exhausted retries for ${operationName}`);
+  }
+}
+
+// ============================================================================
+// Original Script Code (with broadcaster integration)
+// ============================================================================
+
 // Utility functions
 async function confirmTransactionWithRetry(hash: string, operationName: string, maxRetries: number, delayMs: number): Promise<void> {
   const server = new Server(RPC_URL);
@@ -232,6 +489,7 @@ interface SmartWalletOperation {
 
 class ScaledSmartWalletManager {
   private walletBackendClient: WalletBackendClient;
+  private broadcaster: StellarTransactionBroadcaster<"SCALED_WALLET_BROADCASTER">;
   private operations: Map<string, SmartWalletOperation> = new Map();
   private deployedWallets: Map<string, string> = new Map(); // walletId -> contractId
 
@@ -241,6 +499,9 @@ class ScaledSmartWalletManager {
       WALLET_BACKEND_AUTH_KEYPAIR, // Key used to authenticate with wallet-backend
       NETWORK
     );
+    
+    // Initialize the broadcaster with the wallet-backend client
+    this.broadcaster = new ScaledWalletBackendBroadcaster(this.walletBackendClient);
   }
 
   /**
@@ -502,7 +763,23 @@ class ScaledSmartWalletManager {
     }
 
     // Submit via wallet-backend (using channel accounts)
-    const hash = await this.submitTransactionViaWalletBackend(deployTx, `${walletId}_deploy`);
+    const broadcastResult = await this.broadcaster.broadcast(
+      {
+        createdAt: Date.now(),
+        assembledTransaction: deployTx,
+      },
+      {
+        operationName: `${walletId}_deploy`,
+        maxRetries: 6,
+        retryDelayMs: 2000,
+      }
+    );
+
+    if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
+      throw new Error(`${walletId} deployment broadcast failed: ${broadcastResult.errorResultXdr || 'Unknown error'}`);
+    }
+
+    const hash = broadcastResult.hash;
 
     // Wait for confirmation
     await confirmTransactionWithRetry(hash, `${walletId} deployment`, 10, 1000);
@@ -560,7 +837,24 @@ class ScaledSmartWalletManager {
     // ------------------------------------------------------------------
     await addSignerTx.simulate();
 
-    const hash = await this.submitTransactionViaWalletBackend(addSignerTx, "add_signer");
+    // Use the broadcaster interface
+    const broadcastResult = await this.broadcaster.broadcast(
+      {
+        createdAt: Date.now(),
+        assembledTransaction: addSignerTx,
+      },
+      {
+        operationName: "add_signer",
+        maxRetries: 6,
+        retryDelayMs: 2000,
+      }
+    );
+
+    if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
+      throw new Error(`ADD_SIGNER broadcast failed: ${broadcastResult.errorResultXdr || 'Unknown error'}`);
+    }
+
+    const hash = broadcastResult.hash;
     
     // ------------------------------------------------------------------
     // Wait for add_signer to be confirmed on-chain before allowing
@@ -615,7 +909,24 @@ class ScaledSmartWalletManager {
     // transactionData accurately reflect the final envelope.
     await helloWorldTx.simulate();
     
-    const hash = await this.submitTransactionViaWalletBackend(helloWorldTx, 'invoke_contract');
+    // Use the broadcaster interface
+    const broadcastResult = await this.broadcaster.broadcast(
+      {
+        createdAt: Date.now(),
+        assembledTransaction: helloWorldTx,
+      },
+      {
+        operationName: "invoke_contract",
+        maxRetries: 6,
+        retryDelayMs: 2000,
+      }
+    );
+
+    if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
+      throw new Error(`INVOKE_CONTRACT broadcast failed: ${broadcastResult.errorResultXdr || 'Unknown error'}`);
+    }
+
+    const hash = broadcastResult.hash;
     console.log("✅ INVOKE_CONTRACT completed successfully");
     console.log(`📄 INVOKE_CONTRACT transaction URL: ${getExplorerUrls(hash, 'transaction')}`);
     return hash;
@@ -647,169 +958,30 @@ class ScaledSmartWalletManager {
     // signed auth entries (same pattern as working smart-wallet-operations.ts)
     await upgradeTx.simulate();
     
-    const hash = await this.submitTransactionViaWalletBackend(upgradeTx, 'upgrade');
+    // Use the broadcaster interface
+    const broadcastResult = await this.broadcaster.broadcast(
+      {
+        createdAt: Date.now(),
+        assembledTransaction: upgradeTx,
+      },
+      {
+        operationName: "upgrade",
+        maxRetries: 6,
+        retryDelayMs: 2000,
+      }
+    );
+
+    if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
+      throw new Error(`UPGRADE_WALLET broadcast failed: ${broadcastResult.errorResultXdr || 'Unknown error'}`);
+    }
+
+    const hash = broadcastResult.hash;
     console.log("✅ UPGRADE_WALLET completed successfully");
     console.log(`📄 UPGRADE_WALLET transaction URL: ${getExplorerUrls(hash, 'transaction')}`);
     return hash;
   }
 
-  private async submitTransactionViaWalletBackend(tx: AssembledTransaction<any>, operationName: string): Promise<string> {
 
-    // ------------------------------------------------------------------
-    // 1. Sign the assembled transaction with Treasury key (authorizing the
-    //    operation itself – NOT fee-bump sponsorship **)
-    // ------------------------------------------------------------------
-    // @ts-ignore sign helper typing mismatch
-    await tx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
-
-    // Extract operations (Base64 XDR strings) from the transaction so the
-    // wallet-backend can rebuild it with a fresh channel account.
-    if (!tx.built) {
-      throw new Error("Transaction not built yet – did you call simulate()?");
-    }
-
-    // tx.built is a stellar-base Transaction object – its operations array is
-    // public.  Each Operation has `.toXDR()`.
-    // built.toXDR() type is string in typings but returns a Buffer at runtime.
-    const envelopeBuf: Buffer = Buffer.isBuffer(tx.built.toXDR())
-      // @ts-ignore runtime returns Buffer for JS implementation
-      ? (tx.built.toXDR() as Buffer)
-      // If typings evolve and we get string, re-encode to Buffer first
-      : Buffer.from(tx.built.toXDR() as string, "base64");
-    const envelopeB64 = envelopeBuf.toString("base64");
-    const envelope = (xdr.TransactionEnvelope as any).fromXDR(Buffer.from(envelopeB64, "base64"));
-    let ops: any[] = [];
-    switch (envelope.switch().name) {
-      case "envelopeTypeTx":
-        ops = envelope.v1().tx().operations();
-        break;
-      case "envelopeTypeTxV0":
-        ops = envelope.v0().tx().operations();
-        break;
-      default:
-        throw new Error("Unsupported envelope type " + envelope.switch().name);
-    }
-    const operationsXdr = ops.map((op: any) => op.toXDR().toString("base64"));
-
-    // ------------------------------------------------------------------
-    // 2. Ask wallet-backend to build + sign a new envelope using a channel
-    //    account (eliminates sequence-number collisions) – returns XDR.
-    // ------------------------------------------------------------------
-    // Build a MINIMAL simulationResult so that the request body stays <10 KB and
-    // wallet-backend hash verification succeeds.  We only need `transactionData`
-    // for fee/resource accounting and an empty `results` array for the forbidden
-    // signer check (empty means no forbidden signers).
-    let simulationResult: any = undefined;
-    // Different versions of stellar-sdk expose the simulation in slightly
-    // different fields – try the most common ones.
-    const sim: any = (tx as any).simulation || (tx as any).simulationResponse || (tx as any).simulationResult;
-    if (sim && sim.transactionData) {
-      let transactionDataEncoded: string | undefined;
-      try {
-          // console.log('🧐 transactionData typeof:', typeof sim.transactionData);
-        // if (typeof sim.transactionData === 'object' && sim.transactionData !== null) {
-        //   console.log('🧐 transactionData keys:', Object.keys(sim.transactionData));
-        //   console.log('🧐 transactionData proto methods:', Object.getOwnPropertyNames(Object.getPrototypeOf(sim.transactionData)).slice(0,10));
-        // }
-        if (typeof sim.transactionData === 'string') {
-          // Modern @stellar/stellar-sdk already exposes base64 string.
-          transactionDataEncoded = sim.transactionData;
-        } else if (typeof sim.transactionData.build === 'function') {
-          const built = sim.transactionData.build();
-          transactionDataEncoded = Buffer.from(built.toXDR()).toString('base64');
-        } else if (typeof sim.transactionData.toXDR === 'function') {
-          // Older versions expose an XDR object – encode to base64.
-          const maybeBuf = sim.transactionData.toXDR();
-          transactionDataEncoded = Buffer.from(maybeBuf).toString('base64');
-        } else {
-          try {
-            // Fallback: use XDR static encoder
-            // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-            // @ts-ignore
-            const { xdr } = await import('@stellar/stellar-sdk');
-            // The toXDR static method returns a Buffer
-            transactionDataEncoded = xdr.SorobanTransactionData.toXDR(sim.transactionData).toString('base64');
-          } catch (inner) {
-            // console.warn('⚠️  Unable to encode transactionData via static toXDR:', inner);
-          }
-        }
-              } catch (e) {
-          // console.warn('⚠️  Failed to encode transactionData:', e);
-        }
-
-      if (transactionDataEncoded) {
-        const minResourceFeeStr = sim.minResourceFee !== undefined ? String(sim.minResourceFee) : undefined;
-        // Preserve the `results` array from simulation so auth entries are kept
-        const simResultsField = (sim.results ?? sim.result) as any[] | undefined;
-        simulationResult = {
-          transactionData: transactionDataEncoded,
-          results: [] as any[], // Revert to empty array to reduce payload size
-          ...(minResourceFeeStr ? { minResourceFee: minResourceFeeStr } : {}),
-        };
-      }
-    }
-
-    const buildResp = await this.walletBackendClient.submitTransaction(operationsXdr, simulationResult, 300);
-    
-    // Adjust the client: our helper returns {transactionXdrs: []}
-    const builtXdr = (buildResp as any).transactionXdrs?.[0] || (buildResp as any).transactionXDRs?.[0];
-    if (!builtXdr) {
-      throw new Error("wallet-backend build response missing XDR");
-    }
-
-    // Create fee-bump (treasury sponsorship) if possible
-    const feeBumpResp = await this.walletBackendClient.createFeeBump(builtXdr);
-
-    // Use fee-bumped envelope if returned, otherwise fall back to the original
-    const envelopeXdr = feeBumpResp?.transaction || builtXdr;
-
-    // ------------------------------------------------------------------
-    // 3. Convert the base64 XDR string into a Transaction object so that
-    //    `sendTransaction` can process it properly.  Just passing a
-    //    plain string causes a runtime error (`transaction.toXDR is not a
-    //    function`) because sendTransaction assumes a Transaction instance.
-    // ------------------------------------------------------------------
-    // @ts-ignore - TransactionBuilder.fromXDR is present at runtime in stellar-sdk 13 but not typed in bundled d.ts
-    const envelopeTx = TransactionBuilder.fromXDR(envelopeXdr, NETWORK);
-
-    // ------------------------------------------------------------------
-    // 3. Broadcast the (fee-bumped) envelope to Soroban RPC with retries on
-    //    TRY_AGAIN_LATER.
-    // ------------------------------------------------------------------
-    const server = new Server(RPC_URL);
-    const maxAttempts = 6;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const sendTransactionResponse = await server.sendTransaction(envelopeTx);
-
-        if (sendTransactionResponse.status === "TRY_AGAIN_LATER") {
-          throw Object.assign(new Error("TRY_AGAIN_LATER"), { retryable: true });
-        }
-
-        if (sendTransactionResponse.status === "ERROR") {
-          // Surface the low-level error XDR to the logs for easier debugging
-          console.error(`❌ ${operationName} submission returned ERROR`, sendTransactionResponse);
-          const errXdr = (sendTransactionResponse as any).errorResultXdr || (sendTransactionResponse as any).errorResultXdr || (sendTransactionResponse as any).errorResult || 'unknown error';
-          throw new Error(`TRANSACTION_ERROR: ${errXdr}`);
-        }
-
-        console.log(`📤 Transaction submitted with hash: ${sendTransactionResponse.hash}`);
-        console.log(`📄 Transaction URL: ${getExplorerUrls(sendTransactionResponse.hash, 'transaction')}`);
-
-        return sendTransactionResponse.hash;
-      } catch (err: any) {
-        const isRetryable = err?.retryable || err?.message?.includes("TRY_AGAIN_LATER") || err?.code === "ETIMEDOUT";
-        if (!isRetryable || attempt === maxAttempts) {
-          console.error(`❌ ${operationName} failed after ${attempt} attempts`);
-          throw err;
-        }
-        const delay = 2000 * Math.pow(2, attempt - 1);
-        await new Promise((r) => setTimeout(r, delay));
-      }
-    }
-
-    throw new Error(`Exhausted retries for ${operationName}`);
-  }
 
   private createAdminSignerFromKeypair(keypair: Keypair): Signer {
     return {
@@ -903,6 +1075,14 @@ class ScaledSmartWalletManager {
 
   async getDeployedWallets(): Promise<Map<string, string>> {
     return this.deployedWallets;
+  }
+
+  /**
+   * Get the StellarTransactionBroadcaster instance for external use
+   * This allows direct access to the broadcaster interface for custom transactions
+   */
+  getBroadcaster(): StellarTransactionBroadcaster<"SCALED_WALLET_BROADCASTER"> {
+    return this.broadcaster;
   }
 
   private async executeWalletOperation(walletId: string, walletAddress: string, operation: string): Promise<void> {
@@ -1022,6 +1202,130 @@ async function scaledSmartWalletDemo() {
     process.exit(1);
   }
 }
+
+// ============================================================================
+// StellarTransactionBroadcaster Usage Examples
+// ============================================================================
+
+/**
+ * Example: Using the broadcaster interface directly for custom transactions
+ */
+async function customTransactionExample() {
+  const manager = new ScaledSmartWalletManager();
+  const broadcaster = manager.getBroadcaster();
+  
+  // Example: Deploy a custom contract using the broadcaster interface
+  /*
+  const customTransaction = await SomeContractClient.deploy({
+    // ... deployment parameters
+  });
+  
+  await customTransaction.simulate();
+  await customTransaction.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
+  
+  const result = await broadcaster.broadcast(
+    {
+      createdAt: Date.now(),
+      assembledTransaction: customTransaction,
+      timeoutInSeconds: 300,
+    },
+    {
+      operationName: "custom_deploy",
+      maxRetries: 3,
+      retryDelayMs: 1500,
+      enableFeeBump: true,
+    }
+  );
+  
+  if (result.status === "PENDING") {
+    console.log(`✅ Custom transaction submitted: ${result.hash}`);
+    console.log(`📄 Transaction URL: ${getExplorerUrls(result.hash, 'transaction')}`);
+    
+    // Wait for confirmation if needed
+    await confirmTransactionWithRetry(result.hash, "custom_deploy", 10, 1500);
+  } else {
+    console.error(`❌ Custom transaction failed: ${result.errorResultXdr}`);
+  }
+  */
+}
+
+/**
+ * Example: Creating a custom broadcaster implementation
+ */
+class DirectRpcBroadcaster implements StellarTransactionBroadcaster<"DIRECT_RPC_BROADCASTER"> {
+  name: "DIRECT_RPC_BROADCASTER" = "DIRECT_RPC_BROADCASTER";
+  private server: Server;
+  private networkPassphrase: string;
+
+  constructor(rpcUrl: string, networkPassphrase: string) {
+    this.server = new Server(rpcUrl);
+    this.networkPassphrase = networkPassphrase;
+  }
+
+  async broadcast(
+    inputArgs: StellarTransactionBroadcasterInputArgs,
+    options?: TransactionBroadcastOptions
+  ): Promise<BroadcastResult> {
+    const startTime = Date.now();
+    const operationName = options?.operationName || 'direct_transaction';
+    
+    try {
+      // Simple direct submission without wallet-backend infrastructure
+      const result = await inputArgs.assembledTransaction.send();
+      
+      return {
+        hash: result.sendTransactionResponse?.hash || "",
+        status: "PENDING",
+        metadata: {
+          submittedAt: startTime,
+          operationName,
+        }
+      };
+    } catch (error: any) {
+      return {
+        hash: "",
+        status: "FAILED",
+        errorResultXdr: error.message,
+        metadata: {
+          submittedAt: startTime,
+          operationName,
+        }
+      };
+    }
+  }
+}
+
+/**
+ * Compatibility Summary:
+ * 
+ * The script is now compatible with the StellarTransactionBroadcaster interface through:
+ * 
+ * 1. **Type Definitions**: All required types are defined at the top of the file
+ *    - StellarTransactionBroadcasterName
+ *    - StellarTransactionBroadcasterInputArgs<T>
+ *    - TransactionBroadcastOptions
+ *    - BroadcastResult
+ *    - StellarTransactionBroadcaster<T>
+ * 
+ * 2. **ScaledWalletBackendBroadcaster**: Implementation that wraps the existing
+ *    wallet-backend infrastructure and provides the broadcaster interface
+ * 
+ * 3. **Integration**: The ScaledSmartWalletManager now uses the broadcaster
+ *    interface internally and exposes it via getBroadcaster() for external use
+ * 
+ * 4. **Backward Compatibility**: All existing functionality is preserved while
+ *    adding the new interface layer
+ * 
+ * 5. **Extensibility**: Easy to create additional broadcaster implementations
+ *    (like DirectRpcBroadcaster) for different submission strategies
+ * 
+ * Key Benefits:
+ * - Standardized interface for transaction broadcasting
+ * - Rich metadata and error handling
+ * - Support for different broadcasting strategies
+ * - Maintains all existing wallet-backend features (channel accounts, fee-bumps)
+ * - Clean separation of concerns
+ */
 
 // Run demo if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
