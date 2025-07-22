@@ -1,12 +1,16 @@
 import { Keypair, BASE_FEE, hash, nativeToScVal } from "@stellar/stellar-sdk";
 import { Buffer } from "buffer";
+import crypto from "crypto";
 import { Client as FactoryClient } from "factory";
+import { xdr as factoryXdr } from "factory";
 import {
   Client as SmartAccountClient,
   Signer,
   SignerKey,
   SignerProof,
   xdr,
+  Ed25519Signer,
+  SignerRole,
 } from "smart_account";
 import {
   FACTORY_WASM_HASH,
@@ -159,6 +163,40 @@ async function authorizeWithSmartAccount(
 }
 
 /**
+ * Helper to ensure ScVal objects have the correct class identity for the factory package.
+ * When funcArgsToScVals from the smart_account package returns xdr.ScVal objects,
+ * they have the class identity from smart_account's XDR module. The factory package
+ * expects ScVal objects from its own XDR module for instanceof checks to pass.
+ * Round-tripping through XDR ensures class identity compatibility between packages.
+ */
+function normalizeScVal(val: xdr.ScVal): xdr.ScVal {
+  // `.toXDR()` gives us the raw bytes representing the ScVal union. We then
+  // deserialize them again so `instanceof xdr.ScVal` checks succeed.
+  return xdr.ScVal.fromXDR(val.toXDR());
+}
+
+/**
+ * Encodes the constructor arguments (currently only the `signers` vector)
+ * into the `ScVal` list expected by the factory's `deploy` call.
+ */
+function encodeConstructorArgs(
+  client: SmartAccountClient,
+  signers: Signer[]
+): xdr.ScVal[] {
+  return client.spec
+    .funcArgsToScVals(CONSTRUCTOR_FUNC, { signers })
+    .map((sv) => {
+      // Reparse through the Factory's XDR module to ensure class identity
+      return factoryXdr.ScVal.fromXDR((sv as xdr.ScVal).toXDR());
+    });
+}
+
+// Normalize an array of ScVals so that each element uses the Factory bindings' XDR classes.
+function toFactoryScVals(vals: xdr.ScVal[]): xdr.ScVal[] {
+  return vals.map((v) => factoryXdr.ScVal.fromXDR(v.toXDR()));
+}
+
+/**
  * Step 1: Deploy the ContractFactory
  */
 async function deployFactory(): Promise<string> {
@@ -288,21 +326,26 @@ async function deploySmartAccount(factoryContractId: string): Promise<string> {
       publicKey: TREASURY_KEYPAIR.publicKey(),
     });
 
-    const deployTx = await factoryClient.deploy(
+    const deployTx = await (factoryClient as any).deploy(
       {
         caller: DEPLOYER_KEYPAIR.publicKey(),
         deployment_args: {
           wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
           salt: salt,
-          constructor_args: smartAccountClient.spec.funcArgsToScVals(
-            CONSTRUCTOR_FUNC,
-            constructor_args
+          // For the factory, constructor_args is Vec<Val> where each
+          // entry corresponds to one argument of the contract constructor.
+          // The smart-account constructor takes a single `signers` Vec, so
+          // we just provide that Vec directly and let the factory bindings
+          // encode it.
+          // Using encoded constructor arguments ensures proper type identity
+          // compatibility between smart_account and factory package XDR modules.
+          constructor_args: encodeConstructorArgs(
+            smartAccountClient,
+            [createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)]
           ),
         },
       },
-      {
-        simulate: true,
-      }
+      { simulate: true }
     );
 
     printAuthEntries(deployTx);
@@ -311,7 +354,6 @@ async function deploySmartAccount(factoryContractId: string): Promise<string> {
       ...basicNodeSigner(DEPLOYER_KEYPAIR, NETWORK),
     });
     await deployTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
-    await deployTx.simulate();
     const result = await deployTx.send();
     const hash = result.sendTransactionResponse?.hash;
     if (!hash) {
@@ -442,23 +484,21 @@ async function deployAndInvokeContractWithSmartAccount(
     },
   };
   console.log("📍 Encoding signer args:", addSignerArgs);
-  const addSignerVal = smartAccountClient.spec.funcArgsToScVals(
-    "add_signer",
-    addSignerArgs
+  const addSignerVal = toFactoryScVals(
+    smartAccountClient.spec.funcArgsToScVals("add_signer", addSignerArgs) as xdr.ScVal[]
   );
   console.log("📍 Encoded signer args");
   // Requires both deployer and wallet auth
-  const combinedTx = await factoryClient.deploy_account_and_invoke(
+  const combinedTx = await (factoryClient as any).deploy_account_and_invoke(
     {
       caller: DEPLOYER_KEYPAIR.publicKey(),
       deployment_args: {
         wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
         salt: salt,
-        constructor_args: smartAccountClient.spec.funcArgsToScVals(
-          CONSTRUCTOR_FUNC,
-          {
-            signers: [createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)],
-          }
+        // Provide constructor arguments with proper XDR type identity for factory compatibility.
+        constructor_args: encodeConstructorArgs(
+          smartAccountClient,
+          [createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)]
         ),
       },
       calls: [
@@ -472,11 +512,11 @@ async function deployAndInvokeContractWithSmartAccount(
         {
           contract_id: HELLO_WORLD_CONTRACT_ID,
           func: "hello",
-          args: [
+          args: toFactoryScVals([
             nativeToScVal(walletAddress, {
               type: "address",
-            }),
-          ],
+            }) as xdr.ScVal,
+          ]),
         },
       ],
     },
@@ -640,8 +680,8 @@ function createAdminSignerFromKeypair(adminSignerKeyPair: Keypair): Signer {
     values: [
       {
         public_key: Buffer.from(adminSignerKeyPair.rawPublicKey()),
-      },
-      { tag: "Admin", values: undefined },
+      } as Ed25519Signer,
+      { tag: "Admin", values: undefined } as SignerRole,
     ] as const,
   };
 }

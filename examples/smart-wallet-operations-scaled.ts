@@ -2,27 +2,27 @@ import { Keypair, BASE_FEE, hash, nativeToScVal, StrKey, TransactionBuilder } fr
 import { Buffer } from "buffer";
 import { randomBytes } from "crypto";
 import { Client as FactoryClient } from "factory";
+import { xdr as factoryXdr } from "factory";
 import {
-  Client as SmartWalletClient,
+  Client as SmartAccountClient,
   Signer,
   SignerKey,
   SignerProof,
   xdr,
-} from "smart_wallet";
+} from "smart_account";
 import {
   FACTORY_WASM_HASH,
   ADMIN_SIGNER_KEYPAIR,
   ROOT_KEYPAIR,
   DEPLOYER_KEYPAIR,
   DELEGATED_SIGNER_KEYPAIR,
-  SW_WASM_HASH,
+  SA_WASM_HASH,
   CONSTRUCTOR_FUNC,
   RPC_URL,
   NETWORK,
   TREASURY_KEYPAIR,
   HELLO_WORLD_CONTRACT_ID,
 } from "./consts.js";
-import { deployFactory, grantDeployerRole } from "./smart-wallet-operations.js";
 import {
   AssembledTransaction,
   basicNodeSigner,
@@ -31,6 +31,40 @@ import { Server } from "@stellar/stellar-sdk/rpc";
 import { printAuthEntries } from "./utils.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
+
+// Utility functions
+async function confirmTransactionWithRetry(hash: string, operationName: string, maxRetries: number, delayMs: number): Promise<void> {
+  const server = new Server(RPC_URL);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const tx = await server.getTransaction(hash);
+      if (tx.status === "SUCCESS") {
+        return;
+      } else if (tx.status === "FAILED") {
+        throw new Error(`${operationName} transaction failed`);
+      }
+      // Status is "NOT_FOUND", retry
+    } catch (error: any) {
+      if (attempt === maxRetries) {
+        throw new Error(`${operationName} confirmation failed after ${maxRetries} attempts: ${error.message}`);
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+  }
+  throw new Error(`${operationName} confirmation timed out after ${maxRetries} attempts`);
+}
+
+function encodeConstructorArgs(
+  client: SmartAccountClient,
+  signers: Signer[]
+): xdr.ScVal[] {
+  return client.spec
+    .funcArgsToScVals(CONSTRUCTOR_FUNC, { signers })
+    .map((sv) => {
+      // Reparse through the Factory's XDR module to ensure class identity
+      return factoryXdr.ScVal.fromXDR((sv as xdr.ScVal).toXDR());
+    });
+}
 
 /**
  * Generate block explorer URLs for Stellar testnet
@@ -120,6 +154,7 @@ class ScaledWalletBackendClient implements WalletBackendClient {
 
   private async walletBackendRequest(method: string, path: string, body: any = null): Promise<any> {
     const bodyString = body ? JSON.stringify(body) : '';
+    
     // The wallet-backend verifier only reads and hashes the first 10_240 bytes
     // of the request body (see DefaultMaxBodySize in jwt_http_signer_verifier.go).
     // We must mirror that logic when generating the JWT, otherwise hashes will
@@ -149,10 +184,6 @@ class ScaledWalletBackendClient implements WalletBackendClient {
       'Content-Type': 'application/json'
     };
     
-    // console.log(`🌐 ${method.toUpperCase()} ${this.walletBackendUrl}${path}`);
-    // console.log(`📦 Request body size: ${bodyBytes.length} bytes`);
-    // console.log(`🔑 JWT (aud=${audience}, sub=${this.authKeypair.publicKey()}): ${jwt}`);
-    
     const response = await fetch(`${this.walletBackendUrl}${path}`, {
       method,
       headers,
@@ -160,12 +191,11 @@ class ScaledWalletBackendClient implements WalletBackendClient {
     });
     
     const responseText = await response.text();
-    // console.log(`📡 Status: ${response.status}`);
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${responseText}`);
     }
-    
+
     return responseText ? JSON.parse(responseText) : null;
   }
 
@@ -214,31 +244,109 @@ class ScaledSmartWalletManager {
   }
 
   /**
+   * Deploy a new factory contract for this session
+   */
+  async deployFactory(): Promise<string> {
+    try {
+      const deployTx = await FactoryClient.deploy(
+        { admin: ROOT_KEYPAIR.publicKey() },
+        {
+          wasmHash: FACTORY_WASM_HASH,
+          salt: Buffer.from(crypto.getRandomValues(new Uint8Array(32))),
+          networkPassphrase: NETWORK,
+          fee: BASE_FEE,
+          rpcUrl: RPC_URL,
+          publicKey: ROOT_KEYPAIR.publicKey(),
+        }
+      );
+
+      await deployTx.simulate();
+      await deployTx.sign(basicNodeSigner(ROOT_KEYPAIR, NETWORK));
+      const result = await deployTx.send();
+      const hash = result.sendTransactionResponse?.hash;
+      if (!hash) {
+        throw new Error("Factory deployment failed: " + JSON.stringify(result));
+      }
+      
+      console.log("📤 Transaction submitted with hash:", hash);
+      await confirmTransactionWithRetry(hash, "Factory deployment", 10, 1500);
+      
+      const contractId = deployTx.result.options.contractId;
+      console.log("✅ Factory deployed successfully");
+      console.log("📍 Factory contract ID:", contractId);
+      console.log(`📄 Factory Contract URL: ${getExplorerUrls(contractId, 'contract')}`);
+      
+      // Grant 'deployer' role to DEPLOYER_KEYPAIR (matches single-wallet script)
+      const factoryClient = new FactoryClient({
+        contractId,
+        networkPassphrase: NETWORK,
+        rpcUrl: RPC_URL,
+        allowHttp: false,
+        publicKey: TREASURY_KEYPAIR.publicKey(),
+      });
+
+      console.log("🔑 Granting deployer role...");
+      const grantRoleTx = await factoryClient.grant_role(
+        {
+          caller: ROOT_KEYPAIR.publicKey(),
+          account: DEPLOYER_KEYPAIR.publicKey(),
+          role: "deployer",
+        },
+        { simulate: true }
+      );
+
+      await grantRoleTx.signAuthEntries({
+        address: ROOT_KEYPAIR.publicKey(),
+        ...basicNodeSigner(ROOT_KEYPAIR, NETWORK),
+      });
+      await grantRoleTx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
+
+      const grantResult = await grantRoleTx.send();
+      const grantHash = grantResult.sendTransactionResponse?.hash;
+      if (!grantHash) {
+        throw new Error("Grant role failed: " + JSON.stringify(grantResult));
+      }
+      
+      console.log(`📤 Grant role tx hash: ${grantHash}`);
+      await confirmTransactionWithRetry(grantHash, "Grant role", 10, 1500);
+      console.log("✅ Deployer role granted successfully");
+      console.log(`📄 Deployer Role URL: ${getExplorerUrls(contractId, 'contract')}`);
+      
+      return contractId;
+    } catch (error) {
+      console.error("❌ Factory deployment failed:", error);
+      throw error;
+    }
+  }
+
+  /**
    * Deploy multiple smart wallets in parallel using channel accounts
    */
   async deploySmartWalletsInParallel(factoryContractId: string, walletCount: number): Promise<Map<string, string>> {
-    console.log(`\n🚀 Deploying ${walletCount} smart wallets in parallel`);
-    
-    const deploymentPromises: Promise<string>[] = [];
-    
+    console.log(`🚀 Deploying ${walletCount} smart wallets in parallel\n`);
+
+    // Create all deployment promises for parallel execution
+    const deploymentPromises = [];
     for (let i = 0; i < walletCount; i++) {
       const walletId = `wallet_${i + 1}`;
       deploymentPromises.push(this.deploySingleWallet(factoryContractId, walletId));
     }
     
-    // Execute all deployments in parallel
+    // Execute all deployments in parallel (maximize throughput with channel accounts)
     const results = await Promise.allSettled(deploymentPromises);
     
-    results.forEach((result, index) => {
-      const walletId = `wallet_${index + 1}`;
+    // Process results
+    for (let i = 0; i < results.length; i++) {
+      const walletId = `wallet_${i + 1}`;
+      const result = results[i];
+      
       if (result.status === 'fulfilled') {
         this.deployedWallets.set(walletId, result.value);
         console.log(`✅ ${walletId} deployed: ${result.value}`);
-        console.log(`📄 ${walletId} URL: ${getExplorerUrls(result.value, 'contract')}`);
       } else {
         console.error(`❌ ${walletId} failed: ${result.reason}`);
       }
-    });
+    }
     
     return this.deployedWallets;
   }
@@ -278,19 +386,7 @@ class ScaledSmartWalletManager {
       const currentChain = walletOperationChains.get(walletId)!;
 
       const newChain = currentChain.then(() => {
-        console.log(`🔄 ${walletId}: Starting ${operation}`);
-        switch (operation) {
-          case 'ADD_SIGNER':
-            const signerToAdd = params?.signerKeypair || DELEGATED_SIGNER_KEYPAIR;
-            return this.addSignerToWallet(contractId, signerToAdd);
-          case 'INVOKE_CONTRACT':
-            const contractToInvoke = params?.contractId || HELLO_WORLD_CONTRACT_ID;
-            return this.invokeContractWithWallet(contractId, contractToInvoke);
-          case 'UPGRADE_WALLET':
-            return this.upgradeWallet(contractId);
-          default:
-            throw new Error(`Unsupported operation: ${operation}`);
-        }
+        return this.executeWalletOperation(walletId, contractId, operation);
       });
       walletOperationChains.set(walletId, newChain);
     }
@@ -314,7 +410,20 @@ class ScaledSmartWalletManager {
   }
 
   private async deploySingleWallet(factoryContractId: string, walletId: string): Promise<string> {
+    console.log(`🚀 Starting deployment for ${walletId}`);
+    
+    // Add timeout wrapper for RPC calls
+    const withTimeout = <T>(promise: Promise<T>, ms: number, operation: string): Promise<T> => {
+      return Promise.race([
+        promise,
+        new Promise<never>((_, reject) => 
+          setTimeout(() => reject(new Error(`${operation} timed out after ${ms}ms`)), ms)
+        )
+      ]);
+    };
+
     const salt = randomBytes(32);
+    console.log(`📍 ${walletId}: Generated salt: ${Buffer.from(salt).toString('hex').slice(0, 16)}...`);
     
     const factoryClient = new FactoryClient({
       contractId: factoryContractId,
@@ -325,7 +434,31 @@ class ScaledSmartWalletManager {
     });
 
     // Get predicted address
-    const addressTx = await factoryClient.get_deployed_address({ salt });
+    const startTime = Date.now();
+    
+    let addressTx;
+    
+    // Retry logic for get_deployed_address
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 1000; // 1 second
+    
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        addressTx = await withTimeout(factoryClient.get_deployed_address({ salt }), 30000, `get_deployed_address for ${walletId} (attempt ${attempt})`);
+        break;
+      } catch (error: any) {
+        if (attempt === MAX_RETRIES) {
+          throw new Error(`${walletId}: Failed to get deployed address after ${MAX_RETRIES} attempts: ${error.message}`);
+        }
+        console.log(`⚠️  ${walletId}: get_deployed_address attempt ${attempt} failed: ${error.message}, retrying...`);
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+      }
+    }
+    
+    if (!addressTx) {
+      throw new Error(`${walletId}: Failed to get deployed address after ${MAX_RETRIES} attempts`);
+    }
+    
     const predictedAddress = addressTx.result;
     // console.log(`📍 ${walletId} predicted address: ${predictedAddress}`);
 
@@ -334,7 +467,7 @@ class ScaledSmartWalletManager {
       signers: [this.createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)],
     };
     
-    const smartWalletClient = new SmartWalletClient({
+    const smartAccountClient = new SmartAccountClient({
       contractId: predictedAddress,
       networkPassphrase: NETWORK,
       rpcUrl: RPC_URL,
@@ -343,46 +476,42 @@ class ScaledSmartWalletManager {
     });
 
     // Build deployment transaction
-    const deployTx = await factoryClient.deploy(
+    const deployTx = await (factoryClient as any).deploy(
       {
         caller: DEPLOYER_KEYPAIR.publicKey(),
-        wasm_hash: Buffer.from(SW_WASM_HASH, "hex"),
-        salt: salt,
-        constructor_args: smartWalletClient.spec.funcArgsToScVals(
-          CONSTRUCTOR_FUNC,
-          constructor_args
-        ),
+        deployment_args: {
+          wasm_hash: Buffer.from(SA_WASM_HASH, "hex"),
+          salt: salt,
+          constructor_args: encodeConstructorArgs(
+            smartAccountClient,
+            [this.createAdminSignerFromKeypair(ADMIN_SIGNER_KEYPAIR)]
+          ),
+        },
       },
       { simulate: true }
     );
 
-    // Sign with deployer auth
-    await deployTx.signAuthEntries({
-      address: DEPLOYER_KEYPAIR.publicKey(),
-      ...basicNodeSigner(DEPLOYER_KEYPAIR, NETWORK),
-    });
-
-    // Submit through wallet-backend for parallel execution
-    const deployHash = await this.submitTransactionViaWalletBackend(deployTx, `${walletId}_deploy`);
-
-    // ------------------------------------------------------------------
-    // Wait until wallet deployment is confirmed on-chain before allowing
-    // operations to proceed. This prevents `Error(Storage, MissingValue)`
-    // because the wallet contract state needs to be available.
-    // Use faster retry intervals for better throughput.
-    // ------------------------------------------------------------------
+    // Sign auth entries with DEPLOYER (required for factory authorization)
     try {
-      await confirmTransactionWithRetry(deployHash, `${walletId}_deploy`, 10, 1500);
-          } catch (e: any) {
-        // console.warn(`⚠️  ${walletId} deployment confirmation failed:`, e.message || e);
-        throw e; // Re-throw to fail deployment
-      }
+      await deployTx.signAuthEntries({
+        address: DEPLOYER_KEYPAIR.publicKey(),
+        ...basicNodeSigner(DEPLOYER_KEYPAIR, NETWORK),
+      });
+    } catch (authErr: any) {
+      throw new Error(`${walletId}: Failed to sign auth entries: ${authErr.message}`);
+    }
+
+    // Submit via wallet-backend (using channel accounts)
+    const hash = await this.submitTransactionViaWalletBackend(deployTx, `${walletId}_deploy`);
+
+    // Wait for confirmation
+    await confirmTransactionWithRetry(hash, `${walletId} deployment`, 10, 1000);
 
     return predictedAddress;
   }
 
   private async addSignerToWallet(smartWalletContractId: string, signerKeypair: Keypair): Promise<string> {
-    const smartWalletClient = new SmartWalletClient({
+    const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
       rpcUrl: RPC_URL,
@@ -396,7 +525,7 @@ class ScaledSmartWalletManager {
     // Build the transaction WITHOUT simulating first, so we can attach the
     // required wallet authorization before hitting the RPC.  Simulation will
     // fail if the auth entry is missing.
-    const addSignerTx = await smartWalletClient.add_signer(
+    const addSignerTx = await smartAccountClient.add_signer(
       {
         signer: {
           tag: "Ed25519",
@@ -418,11 +547,11 @@ class ScaledSmartWalletManager {
     // ------------------------------------------------------------------
     // 2) Sign those auth entries with the existing Admin signer.
     // ------------------------------------------------------------------
-    await this.authorizeWithSmartWallet(
+    await this.authorizeWithSmartAccount(
       addSignerTx,
       smartWalletContractId,
       ADMIN_SIGNER_KEYPAIR,
-      smartWalletClient
+      smartAccountClient
     );
 
     // ------------------------------------------------------------------
@@ -450,7 +579,7 @@ class ScaledSmartWalletManager {
   }
 
   private async invokeContractWithWallet(smartWalletContractId: string, contractId: string): Promise<string> {
-    const smartWalletClient = new SmartWalletClient({
+    const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
       rpcUrl: RPC_URL,
@@ -480,7 +609,7 @@ class ScaledSmartWalletManager {
     // ------------------------------------------------------------------
     await helloWorldTx.simulate();
 
-    await this.authorizeWithSmartWallet(helloWorldTx, smartWalletContractId, DELEGATED_SIGNER_KEYPAIR, smartWalletClient);
+    await this.authorizeWithSmartAccount(helloWorldTx, smartWalletContractId, DELEGATED_SIGNER_KEYPAIR, smartAccountClient);
 
     // Re-simulate now that authorization is present so resource limits &
     // transactionData accurately reflect the final envelope.
@@ -493,7 +622,7 @@ class ScaledSmartWalletManager {
   }
 
   private async upgradeWallet(smartWalletContractId: string): Promise<string> {
-    const smartWalletClient = new SmartWalletClient({
+    const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
       rpcUrl: RPC_URL,
@@ -507,12 +636,12 @@ class ScaledSmartWalletManager {
     // 2. Authorize with smart wallet
     // 3. Re-simulate to finalize with signed auth entries
     // ------------------------------------------------------------------
-    const upgradeTx = await smartWalletClient.upgrade(
-      { new_wasm_hash: Buffer.from(SW_WASM_HASH, "hex") },
+    const upgradeTx = await smartAccountClient.upgrade(
+      { new_wasm_hash: Buffer.from(SA_WASM_HASH, "hex") },
       { simulate: true }
     );
 
-    await this.authorizeWithSmartWallet(upgradeTx, smartWalletContractId, ADMIN_SIGNER_KEYPAIR, smartWalletClient);
+    await this.authorizeWithSmartAccount(upgradeTx, smartWalletContractId, ADMIN_SIGNER_KEYPAIR, smartAccountClient);
     
     // Re-simulate after authorization to finalize the transaction with 
     // signed auth entries (same pattern as working smart-wallet-operations.ts)
@@ -525,11 +654,10 @@ class ScaledSmartWalletManager {
   }
 
   private async submitTransactionViaWalletBackend(tx: AssembledTransaction<any>, operationName: string): Promise<string> {
-    // console.log(`🔄 Submitting ${operationName} via wallet-backend...`);
 
     // ------------------------------------------------------------------
     // 1. Sign the assembled transaction with Treasury key (authorizing the
-    //    operation itself – NOT fee-bump sponsorship *)
+    //    operation itself – NOT fee-bump sponsorship **)
     // ------------------------------------------------------------------
     // @ts-ignore sign helper typing mismatch
     await tx.sign(basicNodeSigner(TREASURY_KEYPAIR, NETWORK));
@@ -611,16 +739,18 @@ class ScaledSmartWalletManager {
 
       if (transactionDataEncoded) {
         const minResourceFeeStr = sim.minResourceFee !== undefined ? String(sim.minResourceFee) : undefined;
+        // Preserve the `results` array from simulation so auth entries are kept
+        const simResultsField = (sim.results ?? sim.result) as any[] | undefined;
         simulationResult = {
           transactionData: transactionDataEncoded,
-          // Keep array empty – large results blow up the body size unnecessarily.
-          results: [] as any[],
+          results: [] as any[], // Revert to empty array to reduce payload size
           ...(minResourceFeeStr ? { minResourceFee: minResourceFeeStr } : {}),
         };
       }
     }
 
     const buildResp = await this.walletBackendClient.submitTransaction(operationsXdr, simulationResult, 300);
+    
     // Adjust the client: our helper returns {transactionXdrs: []}
     const builtXdr = (buildResp as any).transactionXdrs?.[0] || (buildResp as any).transactionXDRs?.[0];
     if (!builtXdr) {
@@ -635,7 +765,7 @@ class ScaledSmartWalletManager {
 
     // ------------------------------------------------------------------
     // 3. Convert the base64 XDR string into a Transaction object so that
-    //    rpc.Server.sendTransaction receives the expected type.  Passing a
+    //    `sendTransaction` can process it properly.  Just passing a
     //    plain string causes a runtime error (`transaction.toXDR is not a
     //    function`) because sendTransaction assumes a Transaction instance.
     // ------------------------------------------------------------------
@@ -650,29 +780,23 @@ class ScaledSmartWalletManager {
     const maxAttempts = 6;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const sendResp = await server.sendTransaction(envelopeTx);
-        console.log("📡 sendTransaction response:", sendResp);
+        const sendTransactionResponse = await server.sendTransaction(envelopeTx);
 
-        if (sendResp.status === "TRY_AGAIN_LATER") {
+        if (sendTransactionResponse.status === "TRY_AGAIN_LATER") {
           throw Object.assign(new Error("TRY_AGAIN_LATER"), { retryable: true });
         }
 
-        if (sendResp.status === "ERROR") {
+        if (sendTransactionResponse.status === "ERROR") {
           // Surface the low-level error XDR to the logs for easier debugging
-          console.error(`❌ ${operationName} submission returned ERROR`, sendResp);
-          const errXdr = (sendResp as any).errorResultXdr || (sendResp as any).errorResultXdr || (sendResp as any).errorResult || 'unknown error';
+          console.error(`❌ ${operationName} submission returned ERROR`, sendTransactionResponse);
+          const errXdr = (sendTransactionResponse as any).errorResultXdr || (sendTransactionResponse as any).errorResultXdr || (sendTransactionResponse as any).errorResult || 'unknown error';
           throw new Error(`TRANSACTION_ERROR: ${errXdr}`);
         }
 
-        console.log(`📤 Transaction submitted with hash: ${sendResp.hash}`);
-        console.log(`📄 Transaction URL: ${getExplorerUrls(sendResp.hash, 'transaction')}`);
+        console.log(`📤 Transaction submitted with hash: ${sendTransactionResponse.hash}`);
+        console.log(`📄 Transaction URL: ${getExplorerUrls(sendTransactionResponse.hash, 'transaction')}`);
 
-        // confirm
-        confirmTransactionWithRetry(sendResp.hash, operationName, 15, 2000).catch((e) =>
-          console.warn(`⚠️ ${operationName} confirmation failed`)
-        );
-
-        return sendResp.hash;
+        return sendTransactionResponse.hash;
       } catch (err: any) {
         const isRetryable = err?.retryable || err?.message?.includes("TRY_AGAIN_LATER") || err?.code === "ETIMEDOUT";
         if (!isRetryable || attempt === maxAttempts) {
@@ -680,7 +804,6 @@ class ScaledSmartWalletManager {
           throw err;
         }
         const delay = 2000 * Math.pow(2, attempt - 1);
-        // console.log(`⏳ ${operationName} retrying in ${delay}ms…`);
         await new Promise((r) => setTimeout(r, delay));
       }
     }
@@ -688,15 +811,25 @@ class ScaledSmartWalletManager {
     throw new Error(`Exhausted retries for ${operationName}`);
   }
 
-  private async authorizeWithSmartWallet(
+  private createAdminSignerFromKeypair(keypair: Keypair): Signer {
+    return {
+      tag: "Ed25519",
+      values: [
+        { public_key: Buffer.from(keypair.rawPublicKey()) },
+        { tag: "Admin", values: undefined },
+      ] as const,
+    };
+  }
+
+  private async authorizeWithSmartAccount(
     tx: any,
-    smartWalletContractId: string,
+    smartAccountContractId: string,
     signerKeypair: Keypair,
-    smartWalletClient: SmartWalletClient
+    smartAccountClient: SmartAccountClient
   ): Promise<void> {
     const server = new Server(RPC_URL);
     await tx.signAuthEntries({
-      address: smartWalletContractId,
+      address: smartAccountContractId,
       authorizeEntry: async (entry: any) => {
         const clone = xdr.SorobanAuthorizationEntry.fromXDR(entry.toXDR());
         const credentials = clone.credentials().address();
@@ -731,8 +864,8 @@ class ScaledSmartWalletManager {
           new xdr.ScSpecTypeUdt({ name: "SignerProof" })
         );
 
-        const scKey = smartWalletClient.spec.nativeToScVal(key, scKeyType);
-        const scVal = smartWalletClient.spec.nativeToScVal(val, scValType);
+        const scKey = smartAccountClient.spec.nativeToScVal(key, scKeyType);
+        const scVal = smartAccountClient.spec.nativeToScVal(val, scValType);
 
         const scEntry = new xdr.ScMapEntry({ key: scKey, val: scVal });
 
@@ -743,44 +876,56 @@ class ScaledSmartWalletManager {
             );
             break;
           case "scvVec":
+            // Add the new signature to the existing map
             credentials.signature().vec()?.[0].map()?.push(scEntry);
+
             credentials
               .signature()
               .vec()?.[0]
               .map()
               ?.sort((a, b) => {
                 return (
-                  a.key().vec()![0].sym() + a.key().vec()![1].toXDR().join("")
-                ).localeCompare(
-                  b.key().vec()![0].sym() + b.key().vec()![1].toXDR().join("")
+                  a.key().str().toString().localeCompare(b.key().str().toString())
                 );
               });
             break;
           default:
-            throw new Error("Unsupported signature type");
+            throw new Error(
+              `Unsupported signature type: ${credentials.signature().switch().name}`
+            );
         }
 
+        clone.credentials().address().signature(credentials.signature());
         return clone;
       },
     });
   }
 
-  private createAdminSignerFromKeypair(adminSignerKeyPair: Keypair): Signer {
-    return {
-      tag: "Ed25519",
-      values: [
-        { public_key: Buffer.from(adminSignerKeyPair.rawPublicKey()) },
-        { tag: "Admin", values: undefined },
-      ] as const,
-    };
-  }
-
-  async getOperationStatus(operationId: string): Promise<SmartWalletOperation | undefined> {
-    return this.operations.get(operationId);
-  }
-
   async getDeployedWallets(): Promise<Map<string, string>> {
     return this.deployedWallets;
+  }
+
+  private async executeWalletOperation(walletId: string, walletAddress: string, operation: string): Promise<void> {
+    try {
+      switch (operation) {
+        case 'ADD_SIGNER':
+          const signerToAdd = DELEGATED_SIGNER_KEYPAIR;
+          await this.addSignerToWallet(walletAddress, signerToAdd);
+          break;
+        case 'INVOKE_CONTRACT':
+          const contractToInvoke = HELLO_WORLD_CONTRACT_ID;
+          await this.invokeContractWithWallet(walletAddress, contractToInvoke);
+          break;
+        case 'UPGRADE_WALLET':
+          await this.upgradeWallet(walletAddress);
+          break;
+        default:
+          throw new Error(`Unsupported operation: ${operation}`);
+      }
+    } catch (error: any) {
+      console.error(`❌ ${walletId}: Operation failed: ${error.message}`);
+      throw error; // Re-throw to fail the operation chain
+    }
   }
 }
 
@@ -814,24 +959,13 @@ async function scaledSmartWalletDemo() {
     }
     console.log("✅ Wallet-backend is healthy");
 
-    // Phase 0: Deploy factory using direct deployment (original method)
-    // Note: For full scalability, this could also be done via wallet-backend
+    // Phase 0: Deploy factory
     console.log("\n🏭 Phase 0: Factory Setup");
-    console.log("🚀 Deploying factory contract...");
+    const factoryContractId = await manager.deployFactory();
     
-    const factoryContractId = await deployFactory();
-    console.log("✅ Factory deployed successfully");
-    console.log("📍 Factory Contract ID:", factoryContractId);
-    console.log(`📄 Factory Contract URL: ${getExplorerUrls(factoryContractId, 'contract')}`);
-    
-    console.log("🔑 Granting deployer role...");
-    await grantDeployerRole(factoryContractId);
-    console.log("✅ Deployer role granted successfully");
-    console.log(`📄 Deployer Role URL: ${getExplorerUrls(factoryContractId, 'contract')}`);
-    
-    // Deploy 5 smart wallets in parallel
+    // Deploy smart accounts in parallel
     console.log("\n📦 Phase 1: Parallel Smart Wallet Deployment");
-    const walletCount = 5; // Number of smart wallets to deploy in parallel
+    const walletCount = 5; // Test parallel channel accounts
     const deployStartTime = Date.now();
     const deployedWallets = await manager.deploySmartWalletsInParallel(factoryContractId, walletCount);
     const deployTime = Date.now() - deployStartTime;
@@ -888,62 +1022,6 @@ async function scaledSmartWalletDemo() {
     process.exit(1);
   }
 }
-
-/**
- * Enhanced transaction confirmation with retry logic and detailed logging
- */
-async function confirmTransactionWithRetry(
-  hash: string,
-  operationName: string,
-  maxRetries: number = 20,
-  delayMs: number = 2000
-): Promise<void> {
-  const server = new Server(RPC_URL);
-  let retries = 0;
-  
-  // console.log(`🔍 Starting confirmation for ${operationName} (hash: ${hash})`);
-  
-  while (retries < maxRetries) {
-    try {
-      // console.log(`🔍 Checking transaction status (attempt ${retries + 1}/${maxRetries})...`);
-      
-      const tx = await server.getTransaction(hash);
-      // console.log(`📋 Transaction status: ${tx.status}`);
-      
-      if (tx.status === "SUCCESS") {
-        // console.log("✅ Transaction confirmed successfully");
-        return;
-      } else if (tx.status === "FAILED") {
-        // console.error("❌ Transaction failed:", tx);
-        throw new Error(`${operationName} failed`);
-      }
-      
-      // Status is still pending, wait and retry
-      // console.log(`⏳ Transaction status: ${tx.status}, waiting ${delayMs}ms...`);
-      
-          } catch (error: any) {
-        if (error.message?.includes("NOT_FOUND") && retries < maxRetries - 1) {
-          // console.log(`⏳ Transaction not found yet, waiting ${delayMs}ms...`);
-        } else if (retries === maxRetries - 1) {
-          throw new Error(`Transaction confirmation timeout for ${operationName}: ${error.message}`);
-        } else {
-          // console.log(`⚠️ Error checking transaction: ${error.message}, retrying...`);
-        }
-      }
-    
-    retries++;
-    await new Promise(resolve => setTimeout(resolve, delayMs));
-  }
-  
-  throw new Error(`Transaction confirmation timeout for ${operationName} after ${maxRetries} attempts`);
-}
-
-// Export for use
-export { 
-  ScaledSmartWalletManager, 
-  ScaledWalletBackendClient,
-  scaledSmartWalletDemo 
-};
 
 // Run demo if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
