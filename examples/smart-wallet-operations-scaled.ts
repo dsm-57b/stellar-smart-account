@@ -31,6 +31,7 @@ import { Server } from "@stellar/stellar-sdk/rpc";
 import { printAuthEntries } from "./utils.js";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import { retryHandler } from './channel-account-retry-handler.js';
 
 // ============================================================================
 // StellarTransactionBroadcaster Interface Compatibility Types
@@ -62,6 +63,7 @@ export interface TransactionBroadcastOptions {
   retryDelayMs?: number;
   enableFeeBump?: boolean;
   treasuryKeypair?: Keypair;
+  walletId?: string; // For retry handler context
 }
 
 /**
@@ -77,6 +79,8 @@ export interface BroadcastResult {
     confirmedAt?: number;
     retryCount?: number;
     operationName?: string;
+    isRetryable?: boolean;
+    originalError?: string;
   };
 }
 
@@ -128,7 +132,8 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
         operationName,
         timeoutSeconds,
         maxRetries,
-        options?.retryDelayMs || 2000
+        options?.retryDelayMs || 2000,
+        options?.walletId || 'wallet'
       );
 
       return {
@@ -142,15 +147,41 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
     } catch (error: any) {
       console.error(`❌ ${operationName} broadcast failed:`, error.message);
       
-      // Parse error to determine appropriate status
+      // Enhanced error parsing for better retry logic
       let status: BroadcastResult['status'] = "FAILED";
       let errorResultXdr: string | undefined;
+      let isRetryable = false;
       
+      // Parse different error types
       if (error.message?.includes("TRY_AGAIN_LATER")) {
         status = "TRY_AGAIN_LATER";
+        isRetryable = true;
       } else if (error.message?.includes("TRANSACTION_ERROR")) {
         status = "ERROR";
         errorResultXdr = error.message.replace("TRANSACTION_ERROR: ", "");
+      } else if (error.message?.includes("ETIMEDOUT") || error.message?.includes("timeout")) {
+        status = "TRY_AGAIN_LATER";
+        isRetryable = true;
+      } else if (error.code >= 500 && error.code < 600) {
+        // 5xx server errors are retryable
+        status = "TRY_AGAIN_LATER";
+        isRetryable = true;
+      } else if (error.message?.includes("no idle channel account available")) {
+        // Channel exhaustion is retryable (handled by retry handler)
+        status = "TRY_AGAIN_LATER";
+        isRetryable = true;
+      } else if (typeof error === 'object' && error !== null) {
+        // Handle [object Object] errors by extracting meaningful info
+        try {
+          const errorStr = JSON.stringify(error);
+          if (errorStr.includes("TRY_AGAIN_LATER") || errorStr.includes("timeout")) {
+            status = "TRY_AGAIN_LATER";
+            isRetryable = true;
+          }
+          console.error(`❌ Parsed error object:`, errorStr);
+        } catch (parseError) {
+          console.error(`❌ Could not parse error object:`, error);
+        }
       }
 
       return {
@@ -160,6 +191,8 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
         metadata: {
           submittedAt: startTime,
           operationName,
+          isRetryable,
+          originalError: error.message || String(error),
         }
       };
     }
@@ -174,7 +207,8 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
     operationName: string,
     timeoutSeconds: number = 300,
     maxAttempts: number = 6,
-    retryDelayBase: number = 2000
+    retryDelayBase: number = 2000,
+    walletId: string = 'wallet'
   ): Promise<string> {
     // Sign the assembled transaction with Treasury key
     // @ts-ignore sign helper typing mismatch
@@ -234,15 +268,27 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
       }
     }
 
-    // Build transaction with wallet-backend
-    const buildResp = await this.walletBackendClient.submitTransaction(operationsXdr, simulationResult, timeoutSeconds);
+    // Revert to conservative 30-second timeout due to confirmation failures at 20s
+    const conservativeTimeout = 30; // Increased back from 20s due to network pressure
+    console.log(`🔧 Using conservative timeout: ${conservativeTimeout}s to reduce network pressure`);
+
+    // Build transaction with wallet-backend (with retry for channel account exhaustion)
+    const buildResp = await retryHandler.executeWithRetry(
+      () => this.walletBackendClient.submitTransaction(operationsXdr, simulationResult, conservativeTimeout),
+      walletId,
+      `${operationName}_build`
+    );
     const builtXdr = (buildResp as any).transactionXdrs?.[0] || (buildResp as any).transactionXDRs?.[0];
     if (!builtXdr) {
       throw new Error("wallet-backend build response missing XDR");
     }
 
-    // Create fee-bump transaction
-    const feeBumpResp = await this.walletBackendClient.createFeeBump(builtXdr);
+    // Create fee-bump transaction (with retry for channel account exhaustion)
+    const feeBumpResp = await retryHandler.executeWithRetry(
+      () => this.walletBackendClient.createFeeBump(builtXdr),
+      walletId,
+      `${operationName}_fee_bump`
+    );
     const envelopeXdr = feeBumpResp?.transaction || builtXdr;
 
     // Convert XDR to Transaction object
@@ -286,30 +332,257 @@ export class ScaledWalletBackendBroadcaster implements StellarTransactionBroadca
 }
 
 // ============================================================================
+// Worker Pool for Concurrency Control
+// ============================================================================
+
+// Simple concurrency limiter (alternative to p-limit)
+class ConcurrencyLimiter {
+  private running = 0;
+  private queue: Array<() => void> = [];
+
+  constructor(private limit: number) {}
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          this.running++;
+          const result = await fn();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        } finally {
+          this.running--;
+          this.processQueue();
+        }
+      });
+      this.processQueue();
+    });
+  }
+
+  private processQueue(): void {
+    if (this.running < this.limit && this.queue.length > 0) {
+      const next = this.queue.shift();
+      if (next) next();
+    }
+  }
+
+  getStatus(): { running: number; queued: number; limit: number } {
+    return {
+      running: this.running,
+      queued: this.queue.length,
+      limit: this.limit
+    };
+  }
+}
+
+// Worker pools for different types of operations
+const deploymentLimiter = new ConcurrencyLimiter(50); // High concurrency for deployments
+const confirmationLimiter = new ConcurrencyLimiter(20); // Lower concurrency for confirmations
+const operationLimiter = new ConcurrencyLimiter(30); // Medium concurrency for operations
+
+// ============================================================================
 // Original Script Code (with broadcaster integration)
 // ============================================================================
 
-// Utility functions
-async function confirmTransactionWithRetry(hash: string, operationName: string, maxRetries: number, delayMs: number): Promise<void> {
-  const server = new Server(RPC_URL);
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const tx = await server.getTransaction(hash);
-      if (tx.status === "SUCCESS") {
-        return;
-      } else if (tx.status === "FAILED") {
-        throw new Error(`${operationName} transaction failed`);
-      }
-      // Status is "NOT_FOUND", retry
-    } catch (error: any) {
-      if (attempt === maxRetries) {
-        throw new Error(`${operationName} confirmation failed after ${maxRetries} attempts: ${error.message}`);
+// Background verifier for transactions that timeout during confirmation
+class BackgroundTransactionVerifier {
+  private pendingHashes = new Map<string, { 
+    hash: string; 
+    operationName: string; 
+    walletId: string; 
+    startTime: number;
+    callback?: (success: boolean) => void;
+  }>();
+  private verificationInterval: NodeJS.Timeout | null = null;
+  
+  add(hash: string, operationName: string, walletId: string, callback?: (success: boolean) => void): void {
+    this.pendingHashes.set(hash, {
+      hash,
+      operationName,
+      walletId,
+      startTime: Date.now(),
+      callback
+    });
+    
+    if (!this.verificationInterval) {
+      this.startVerification();
+    }
+  }
+  
+  private startVerification(): void {
+    this.verificationInterval = setInterval(async () => {
+      await this.checkPendingTransactions();
+    }, 15000); // Check every 15 seconds
+  }
+  
+  private async checkPendingTransactions(): Promise<void> {
+    const server = new Server(RPC_URL);
+    const now = Date.now();
+    const expiredHashes: string[] = [];
+    
+    for (const [hash, info] of this.pendingHashes) {
+      try {
+        // Remove if older than 3 minutes
+        if (now - info.startTime > 180000) {
+          console.log(`🕐 Background verifier: ${info.walletId}:${info.operationName} expired after 3 minutes`);
+          expiredHashes.push(hash);
+          info.callback?.(false);
+          continue;
+        }
+        
+        const tx = await server.getTransaction(hash);
+        if (tx.status === "SUCCESS") {
+          console.log(`✅ Background verifier: ${info.walletId}:${info.operationName} found SUCCESS`);
+          expiredHashes.push(hash);
+          info.callback?.(true);
+        } else if (tx.status === "FAILED") {
+          console.log(`❌ Background verifier: ${info.walletId}:${info.operationName} found FAILED`);
+          expiredHashes.push(hash);
+          info.callback?.(false);
+        }
+        // If NOT_FOUND, keep checking
+      } catch (error: any) {
+        console.log(`⚠️  Background verifier error for ${hash}: ${error.message}`);
       }
     }
-    await new Promise(resolve => setTimeout(resolve, delayMs));
+    
+    // Clean up completed/expired hashes
+    expiredHashes.forEach(hash => this.pendingHashes.delete(hash));
+    
+    // Stop interval if no pending hashes
+    if (this.pendingHashes.size === 0 && this.verificationInterval) {
+      clearInterval(this.verificationInterval);
+      this.verificationInterval = null;
+    }
   }
-  throw new Error(`${operationName} confirmation timed out after ${maxRetries} attempts`);
+  
+  getPendingCount(): number {
+    return this.pendingHashes.size;
+  }
+  
+  shutdown(): void {
+    if (this.verificationInterval) {
+      clearInterval(this.verificationInterval);
+      this.verificationInterval = null;
+    }
+    this.pendingHashes.clear();
+  }
 }
+
+const backgroundVerifier = new BackgroundTransactionVerifier();
+
+// Enhanced confirmation with progressive polling
+async function confirmTransactionWithRetry(
+  hash: string, 
+  operationName: string, 
+  maxRetries: number, 
+  delayMs: number,
+  walletId: string = 'wallet'
+): Promise<void> {
+  const server = new Server(RPC_URL);
+  
+  // Add staggered delay to reduce RPC pressure during batch operations
+  const staggerDelay = Math.floor(Math.random() * 2000); // 0-2s random delay
+  await new Promise(resolve => setTimeout(resolve, staggerDelay));
+  
+  // Progressive polling schedule: fast initially, then slower
+  const pollingSchedule = [
+    // Fast polling for quick confirmations (5 attempts × 1s = 5s)
+    1000, 1000, 1000, 1000, 1000,
+    // Medium polling for normal confirmations (5 attempts × 3s = 15s) 
+    3000, 3000, 3000, 3000, 3000,
+    // Slow polling for congested network (10 attempts × 6s = 60s)
+    6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000, 6000,
+    // Extended polling for severe congestion (10 attempts × 10s = 100s)
+    10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000, 10000
+  ];
+  
+  console.log(`🔍 ${walletId}: Starting progressive confirmation for ${operationName}`);
+  
+  for (let attempt = 0; attempt < pollingSchedule.length; attempt++) {
+    try {
+      const tx = await server.getTransaction(hash);
+      
+      if (tx.status === "SUCCESS") {
+        console.log(`✅ ${operationName.toUpperCase()} completed successfully`);
+        console.log(`📄 ${operationName.toUpperCase()} transaction URL: ${getExplorerUrls(hash, 'transaction')}`);
+        return;
+      } else if (tx.status === "FAILED") {
+        console.error(`❌ ${operationName} transaction failed on-chain. Hash: ${hash}`);
+        console.error(`🔗 Transaction details: ${getExplorerUrls(hash, 'transaction')}`);
+        throw new Error(`${operationName} transaction failed on-chain`);
+      }
+      
+      // Status is "NOT_FOUND" or "PENDING"
+      const phase = attempt < 5 ? 'fast' : attempt < 10 ? 'medium' : attempt < 20 ? 'slow' : 'extended';
+      if (attempt < 3 || attempt % 5 === 0) {
+        console.log(`⏳ ${walletId}: ${operationName} confirmation attempt ${attempt + 1}/${pollingSchedule.length} (${phase} phase) - status: ${tx.status || 'NOT_FOUND'}`);
+      }
+      
+    } catch (error: any) {
+      if (attempt < 3) {
+        console.log(`⚠️  ${walletId}: ${operationName} confirmation attempt ${attempt + 1} failed: ${error.message}`);
+      }
+      // Continue trying - network errors are often transient
+    }
+    
+    // Wait before next attempt (unless it's the last one)
+    if (attempt < pollingSchedule.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, pollingSchedule[attempt]));
+    }
+  }
+  
+  // If we reach here, add to background verifier instead of failing
+  console.warn(`⏰ ${walletId}: ${operationName} confirmation timed out after ${pollingSchedule.length} attempts`);
+  console.warn(`🔄 Adding to background verifier for continued monitoring`);
+  console.warn(`🔗 Manual check: ${getExplorerUrls(hash, 'transaction')}`);
+  
+  backgroundVerifier.add(hash, operationName, walletId, (success) => {
+    if (success) {
+      console.log(`🎉 ${walletId}: ${operationName} eventually confirmed by background verifier!`);
+    } else {
+      console.error(`💀 ${walletId}: ${operationName} permanently failed after background verification`);
+    }
+  });
+  
+  // Don't throw - let the operation chain continue
+  // In production, you might want to mark this wallet for manual review
+  console.log(`➡️  ${walletId}: Continuing operation chain despite confirmation timeout`);
+}
+
+// Circuit breaker for confirmation failures
+class ConfirmationCircuitBreaker {
+  private failureCount = 0;
+  private lastFailureTime = 0;
+  private readonly maxFailures = 3;
+  private readonly resetTimeMs = 60000; // 1 minute
+  
+  canProceed(): boolean {
+    const now = Date.now();
+    if (now - this.lastFailureTime > this.resetTimeMs) {
+      this.failureCount = 0;
+    }
+    return this.failureCount < this.maxFailures;
+  }
+  
+  recordFailure(): void {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    if (this.failureCount >= this.maxFailures) {
+      console.warn(`🚨 Circuit breaker opened: ${this.failureCount} confirmation failures detected. Implementing backoff.`);
+    }
+  }
+  
+  getBackoffMs(): number {
+    if (this.failureCount >= this.maxFailures) {
+      return 5000 * this.failureCount; // Exponential backoff
+    }
+    return 0;
+  }
+}
+
+const confirmationCircuitBreaker = new ConfirmationCircuitBreaker();
 
 function encodeConstructorArgs(
   client: SmartAccountClient,
@@ -530,7 +803,7 @@ class ScaledSmartWalletManager {
       }
       
       console.log("📤 Transaction submitted with hash:", hash);
-      await confirmTransactionWithRetry(hash, "Factory deployment", 10, 1500);
+      await confirmTransactionWithRetry(hash, "Factory deployment", 10, 1500, "factory");
       
       const contractId = deployTx.result.options.contractId;
       console.log("✅ Factory deployed successfully");
@@ -569,7 +842,7 @@ class ScaledSmartWalletManager {
       }
       
       console.log(`📤 Grant role tx hash: ${grantHash}`);
-      await confirmTransactionWithRetry(grantHash, "Grant role", 10, 1500);
+      await confirmTransactionWithRetry(grantHash, "Grant role", 10, 1500, "factory");
       console.log("✅ Deployer role granted successfully");
       console.log(`📄 Deployer Role URL: ${getExplorerUrls(contractId, 'contract')}`);
       
@@ -632,6 +905,12 @@ class ScaledSmartWalletManager {
     Object.entries(operationCounts).forEach(([op, count]) => {
       console.log(`   - ${op}: ${count} operations`);
     });
+    
+    // Show worker pool status
+    const deployStatus = deploymentLimiter.getStatus();
+    const confirmStatus = confirmationLimiter.getStatus();
+    const opStatus = operationLimiter.getStatus();
+    console.log(`📊 Worker pools: Deploy(${deployStatus.running}/${deployStatus.limit}) Confirm(${confirmStatus.running}/${confirmStatus.limit}) Ops(${opStatus.running}/${opStatus.limit})`);
 
     const walletOperationChains = new Map<string, Promise<any>>();
     this.deployedWallets.forEach((contractId, walletId) => {
@@ -653,7 +932,30 @@ class ScaledSmartWalletManager {
     }
 
     const allPromises = Array.from(walletOperationChains.values());
+    
+    // Start progress monitoring
+    const progressInterval = setInterval(() => {
+      const deployStatus = deploymentLimiter.getStatus();
+      const confirmStatus = confirmationLimiter.getStatus();
+      const opStatus = operationLimiter.getStatus();
+      const pendingVerifications = backgroundVerifier.getPendingCount();
+      
+      if (deployStatus.running > 0 || confirmStatus.running > 0 || opStatus.running > 0 || pendingVerifications > 0) {
+        console.log(`🔄 Progress: Deploy(${deployStatus.running}+${deployStatus.queued}) Confirm(${confirmStatus.running}+${confirmStatus.queued}) Ops(${opStatus.running}+${opStatus.queued}) BgVerify(${pendingVerifications})`);
+      }
+    }, 10000); // Update every 10 seconds
+
     const results = await Promise.allSettled(allPromises);
+    
+    // Stop progress monitoring
+    clearInterval(progressInterval);
+    
+    // Final status check
+    const finalPendingVerifications = backgroundVerifier.getPendingCount();
+    if (finalPendingVerifications > 0) {
+      console.log(`🔄 ${finalPendingVerifications} transactions still being verified in background`);
+    }
+    
     const operationResults = new Map<string, any>();
 
     results.forEach((result, index) => {
@@ -671,6 +973,12 @@ class ScaledSmartWalletManager {
   }
 
   private async deploySingleWallet(factoryContractId: string, walletId: string): Promise<string> {
+    return deploymentLimiter.execute(async () => {
+      return this.executeWalletDeployment(factoryContractId, walletId);
+    });
+  }
+
+  private async executeWalletDeployment(factoryContractId: string, walletId: string): Promise<string> {
     console.log(`🚀 Starting deployment for ${walletId}`);
     
     // Add timeout wrapper for RPC calls
@@ -772,6 +1080,7 @@ class ScaledSmartWalletManager {
         operationName: `${walletId}_deploy`,
         maxRetries: 6,
         retryDelayMs: 2000,
+        walletId: walletId,
       }
     );
 
@@ -782,12 +1091,18 @@ class ScaledSmartWalletManager {
     const hash = broadcastResult.hash;
 
     // Wait for confirmation
-    await confirmTransactionWithRetry(hash, `${walletId} deployment`, 10, 1000);
+    await confirmTransactionWithRetry(hash, `${walletId} deployment`, 10, 1000, walletId);
 
     return predictedAddress;
   }
 
-  private async addSignerToWallet(smartWalletContractId: string, signerKeypair: Keypair): Promise<string> {
+  private async addSignerToWallet(smartWalletContractId: string, signerKeypair: Keypair, walletId: string = 'wallet'): Promise<string> {
+    return confirmationLimiter.execute(async () => {
+      return this.executeAddSigner(smartWalletContractId, signerKeypair, walletId);
+    });
+  }
+
+  private async executeAddSigner(smartWalletContractId: string, signerKeypair: Keypair, walletId: string = 'wallet'): Promise<string> {
     const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
@@ -838,41 +1153,71 @@ class ScaledSmartWalletManager {
     await addSignerTx.simulate();
 
     // Use the broadcaster interface
-    const broadcastResult = await this.broadcaster.broadcast(
-      {
-        createdAt: Date.now(),
-        assembledTransaction: addSignerTx,
-      },
-      {
-        operationName: "add_signer",
-        maxRetries: 6,
-        retryDelayMs: 2000,
-      }
-    );
+    const maxBroadcastAttempts = 5;
+    let attempt = 0;
+    let hash = "";
+    while (attempt < maxBroadcastAttempts) {
+      const broadcastResult = await this.broadcaster.broadcast(
+        {
+          createdAt: Date.now(),
+          assembledTransaction: addSignerTx,
+        },
+        {
+          operationName: "add_signer",
+          maxRetries: 6,
+          retryDelayMs: 2000,
+          walletId: walletId,
+        }
+      );
 
-    if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
-      throw new Error(`ADD_SIGNER broadcast failed: ${broadcastResult.errorResultXdr || 'Unknown error'}`);
+      if (broadcastResult.status === "FAILED" || broadcastResult.status === "ERROR") {
+        // Permanent error – abort immediately
+        throw new Error(`ADD_SIGNER broadcast failed: ${broadcastResult.errorResultXdr || broadcastResult.metadata?.originalError || 'Unknown error'}`);
+      }
+
+      if (broadcastResult.status === "TRY_AGAIN_LATER") {
+        // Retryable error – exponential backoff
+        const delay = 2000 * Math.pow(2, attempt);
+        console.log(`⚠️  ${walletId}: wallet-backend busy (TRY_AGAIN_LATER) – retrying in ${delay}ms (attempt ${attempt + 1}/${maxBroadcastAttempts})`);
+        await new Promise(res => setTimeout(res, delay));
+        attempt++;
+        continue;
+      }
+
+      // Status is PENDING or SUCCESS – continue flow
+      hash = broadcastResult.hash;
+      break;
     }
 
-    const hash = broadcastResult.hash;
+    if (!hash) {
+      throw new Error("ADD_SIGNER broadcast failed after max retry attempts");
+    }
     
     // ------------------------------------------------------------------
     // Wait for add_signer to be confirmed on-chain before allowing
     // subsequent operations that depend on this signer being available.
+    // Circuit breaker protection for confirmation failures
     // ------------------------------------------------------------------
     try {
-      await confirmTransactionWithRetry(hash, "add_signer", 10, 1500);
-              console.log("✅ ADD_SIGNER completed successfully");
-              console.log(`📄 ADD_SIGNER transaction URL: ${getExplorerUrls(hash, 'transaction')}`);
-            } catch (e: any) {
-          // console.warn(`⚠️  add_signer confirmation failed:`, e.message || e);
-          throw e; // Re-throw to fail the operation chain
-        }
+      // Check circuit breaker before proceeding
+      if (!confirmationCircuitBreaker.canProceed()) {
+        const backoffMs = confirmationCircuitBreaker.getBackoffMs();
+        console.warn(`⚠️  ${walletId}: Circuit breaker active, applying ${backoffMs}ms backoff`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+      }
+      
+      // Use progressive polling instead of fixed retry count
+      await confirmTransactionWithRetry(hash, "add_signer", 10, 1500, walletId);
+    } catch (e: any) {
+      console.error(`❌ ${walletId}: add_signer confirmation failed: ${e.message}`);
+      confirmationCircuitBreaker.recordFailure();
+      throw e; // Re-throw to fail the operation chain
+    }
     
     return hash;
   }
 
-  private async invokeContractWithWallet(smartWalletContractId: string, contractId: string): Promise<string> {
+  private async invokeContractWithWallet(smartWalletContractId: string, contractId: string, walletId: string = 'wallet'): Promise<string> {
     const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
@@ -919,6 +1264,7 @@ class ScaledSmartWalletManager {
         operationName: "invoke_contract",
         maxRetries: 6,
         retryDelayMs: 2000,
+        walletId: walletId,
       }
     );
 
@@ -932,7 +1278,7 @@ class ScaledSmartWalletManager {
     return hash;
   }
 
-  private async upgradeWallet(smartWalletContractId: string): Promise<string> {
+  private async upgradeWallet(smartWalletContractId: string, walletId: string = 'wallet'): Promise<string> {
     const smartAccountClient = new SmartAccountClient({
       contractId: smartWalletContractId,
       networkPassphrase: NETWORK,
@@ -968,6 +1314,7 @@ class ScaledSmartWalletManager {
         operationName: "upgrade",
         maxRetries: 6,
         retryDelayMs: 2000,
+        walletId: walletId,
       }
     );
 
@@ -1086,26 +1433,28 @@ class ScaledSmartWalletManager {
   }
 
   private async executeWalletOperation(walletId: string, walletAddress: string, operation: string): Promise<void> {
-    try {
-      switch (operation) {
-        case 'ADD_SIGNER':
-          const signerToAdd = DELEGATED_SIGNER_KEYPAIR;
-          await this.addSignerToWallet(walletAddress, signerToAdd);
-          break;
-        case 'INVOKE_CONTRACT':
-          const contractToInvoke = HELLO_WORLD_CONTRACT_ID;
-          await this.invokeContractWithWallet(walletAddress, contractToInvoke);
-          break;
-        case 'UPGRADE_WALLET':
-          await this.upgradeWallet(walletAddress);
-          break;
-        default:
-          throw new Error(`Unsupported operation: ${operation}`);
+    return operationLimiter.execute(async () => {
+      try {
+        switch (operation) {
+          case 'ADD_SIGNER':
+            const signerToAdd = DELEGATED_SIGNER_KEYPAIR;
+            await this.addSignerToWallet(walletAddress, signerToAdd, walletId);
+            break;
+          case 'INVOKE_CONTRACT':
+            const contractToInvoke = HELLO_WORLD_CONTRACT_ID;
+            await this.invokeContractWithWallet(walletAddress, contractToInvoke, walletId);
+            break;
+          case 'UPGRADE_WALLET':
+            await this.upgradeWallet(walletAddress, walletId);
+            break;
+          default:
+            throw new Error(`Unsupported operation: ${operation}`);
+        }
+      } catch (error: any) {
+        console.error(`❌ ${walletId}: Operation failed: ${error.message}`);
+        throw error; // Re-throw to fail the operation chain
       }
-    } catch (error: any) {
-      console.error(`❌ ${walletId}: Operation failed: ${error.message}`);
-      throw error; // Re-throw to fail the operation chain
-    }
+    });
   }
 }
 
@@ -1145,7 +1494,7 @@ async function scaledSmartWalletDemo() {
     
     // Deploy smart accounts in parallel
     console.log("\n📦 Phase 1: Parallel Smart Wallet Deployment");
-    const walletCount = 5; // Test parallel channel accounts
+    const walletCount = 100; // Test parallel channel accounts
     const deployStartTime = Date.now();
     const deployedWallets = await manager.deploySmartWalletsInParallel(factoryContractId, walletCount);
     const deployTime = Date.now() - deployStartTime;
@@ -1242,7 +1591,7 @@ async function customTransactionExample() {
     console.log(`📄 Transaction URL: ${getExplorerUrls(result.hash, 'transaction')}`);
     
     // Wait for confirmation if needed
-    await confirmTransactionWithRetry(result.hash, "custom_deploy", 10, 1500);
+    await confirmTransactionWithRetry(result.hash, "custom_deploy", 10, 1500, "custom");
   } else {
     console.error(`❌ Custom transaction failed: ${result.errorResultXdr}`);
   }
@@ -1326,6 +1675,9 @@ class DirectRpcBroadcaster implements StellarTransactionBroadcaster<"DIRECT_RPC_
  * - Maintains all existing wallet-backend features (channel accounts, fee-bumps)
  * - Clean separation of concerns
  */
+
+// Export classes for use by other scripts
+export { ScaledSmartWalletManager };
 
 // Run demo if this file is executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {

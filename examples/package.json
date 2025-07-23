@@ -16,8 +16,10 @@
   },
   "dependencies": {
     "@stellar/stellar-sdk": "14.0.0-rc.3",
+    "@types/pg": "^8.15.4",
     "buffer": "^6.0.3",
     "factory": "file:../packages/factory",
+    "pg": "^8.16.3",
     "smart_account": "file:../packages/smart_account"
   },
   "devDependencies": {
