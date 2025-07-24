@@ -1494,10 +1494,16 @@ async function scaledSmartWalletDemo() {
     
     // Deploy smart accounts in parallel
     console.log("\n📦 Phase 1: Parallel Smart Wallet Deployment");
-    const walletCount = 100; // Test parallel channel accounts
+    const walletCount = 200; // Test parallel channel accounts
     const deployStartTime = Date.now();
     const deployedWallets = await manager.deploySmartWalletsInParallel(factoryContractId, walletCount);
     const deployTime = Date.now() - deployStartTime;
+
+    // Toggle whether to run Phase 2 operations (add signer, invoke contract, upgrade)
+    const RUN_OPERATIONS = false;
+    // Initialize counters for summary regardless of flag
+    let operationsCount = 0;
+    let operationsTime = 0;
     
     console.log(`\n✅ Deployed ${deployedWallets.size} wallets:`);
     deployedWallets.forEach((contractId, walletId) => {
@@ -1506,34 +1512,45 @@ async function scaledSmartWalletDemo() {
     });
     console.log(`⏱️  Deployment phase completed in ${deployTime}ms (${(deployTime / walletCount).toFixed(0)}ms per wallet)`);
 
-    // Execute operations on all wallets in parallel
-    console.log("\n⚡ Phase 2: Parallel Smart Wallet Operations");
-    const operations = Array.from(deployedWallets.keys()).flatMap(walletId => [
-      { walletId, operation: 'ADD_SIGNER' as const },
-      { walletId, operation: 'INVOKE_CONTRACT' as const },
-      { walletId, operation: 'UPGRADE_WALLET' as const },
-    ]);
-    
-    const operationsStartTime = Date.now();
-    const operationResults = await manager.executeOperationsInParallel(operations);
-    const operationsTime = Date.now() - operationsStartTime;
-    
-    console.log(`\n✅ Executed ${operationResults.size} operations:`);
-    operationResults.forEach((result, operationKey) => {
-      console.log(`  ${operationKey}: ${result.error ? '❌ ' + result.error : '✅ Success'}`);
-    });
-    console.log(`⏱️  Operations phase completed in ${operationsTime}ms (${(operationsTime / operations.length).toFixed(0)}ms per operation)`);
+    if (RUN_OPERATIONS) {
+      // Execute operations on all wallets in parallel
+      console.log("\n⚡ Phase 2: Parallel Smart Wallet Operations");
+      const operations = Array.from(deployedWallets.keys()).flatMap(walletId => [
+        { walletId, operation: 'ADD_SIGNER' as const },
+        { walletId, operation: 'INVOKE_CONTRACT' as const },
+        { walletId, operation: 'UPGRADE_WALLET' as const },
+      ]);
+
+      const operationsStartTime = Date.now();
+      const operationResults = await manager.executeOperationsInParallel(operations);
+      operationsTime = Date.now() - operationsStartTime;
+      operationsCount = operations.length;
+
+      console.log(`\n✅ Executed ${operationResults.size} operations:`);
+      operationResults.forEach((result, operationKey) => {
+        console.log(`  ${operationKey}: ${result.error ? '❌ ' + result.error : '✅ Success'}`);
+      });
+      console.log(`⏱️  Operations phase completed in ${operationsTime}ms (${(operationsTime / operationsCount).toFixed(0)}ms per operation)`);
+    } else {
+      console.log("\n⚡ Phase 2: Parallel Smart Wallet Operations – SKIPPED (RUN_OPERATIONS = false)");
+    }
 
     const totalTime = Date.now() - startTime;
-    const totalOperations = walletCount + operations.length;
+    const totalOperations = walletCount + operationsCount;
     console.log("\n🎉 Scaled Smart Wallet Demo completed successfully!");
     console.log(`📊 Performance Summary:`);
     console.log(`  - Total time: ${totalTime}ms (${(totalTime / 1000).toFixed(1)}s)`);
     console.log(`  - Wallets deployed: ${walletCount} in ${deployTime}ms`);
-    console.log(`  - Operations executed: ${operations.length} in ${operationsTime}ms`);
-    console.log(`  - Total operations: ${totalOperations}`);
-    console.log(`  - Average throughput: ${(totalOperations / (totalTime / 1000)).toFixed(2)} operations/second`);
-    console.log(`  - Operations per wallet: 3 (add_signer + invoke_contract + upgrade)`);
+    if (RUN_OPERATIONS) {
+      console.log(`  - Operations executed: ${operationsCount} in ${operationsTime}ms`);
+      console.log(`  - Total operations: ${totalOperations}`);
+      console.log(`  - Average throughput: ${(totalOperations / (totalTime / 1000)).toFixed(2)} operations/second`);
+      console.log(`  - Operations per wallet: 3 (add_signer + invoke_contract + upgrade)`);
+    } else {
+      console.log("  - Operations executed: 0 (skipped)");
+      console.log(`  - Total operations: ${walletCount}`);
+      console.log(`  - Average deployment throughput: ${(walletCount / (deployTime / 1000)).toFixed(2)} wallets/second`);
+    }
     
     console.log("\n📄 Deployed Smart Wallets - Block Explorer Links:");
     deployedWallets.forEach((contractId, walletId) => {
